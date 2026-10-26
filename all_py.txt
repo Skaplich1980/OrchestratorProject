@@ -1,0 +1,1576 @@
+
+D:\Project\OrchestratorProject>type "D:\Project\OrchestratorProject\config.py"   & echo.
+# config.py
+"""Конфигурация оркестратора.
+
+Загружает переменные окружения из файла ``.env`` (если он существует)
+и системного окружения. Использует ``pydantic-settings`` для строгой
+валидации типов, чтобы неверный формат (например, ``MAX_STEPS=abc``)
+не приводил к «тихим» сбоям позже в коде.
+
+Все пути и строки — с явными аннотациями типов (PEP 8, Python 3.12+).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+try:
+    # pydantic v2 (pydantic-settings вынесен в отдельное расширение).
+    from pydantic import Field, field_validator
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+except ImportError as exc:  # pragma: no cover — защита от неверной установки
+    # Пользователю понятнее сообщение, чем «модуль не найден» в глубине стека.
+    raise SystemExit(
+        "Пакет pydantic-settings не установлен. "
+        "Выполните: pip install pydantic-settings"
+    ) from exc
+
+
+class Settings(BaseSettings):
+    """Типизированные настройки оркестратора.
+
+    Класс наследуется от :class:`pydantic_settings.BaseSettings`, поэтому
+    автоматически подтягивает значения из переменных окружения и из
+    файла ``.env`` (см. ``model_config``).
+
+    Приоритет загрузки: CLI > переменные окружения > ``.env`` файл >
+    значения по умолчанию, заданные здесь.
+    """
+
+    # Подтягиваем .env из каталога, где запускался скрипт, если он есть.
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",  # неизвестные переменные не ломают загрузку
+        case_sensitive=False,  # DASHSCOPE_API_KEY == dashscope_api_key
+    )
+
+    # --- Обязательные API-данные -------------------------------------------
+    #: API-ключ DashScope. Обязателен: без него вызовы к Qwen не возможны.
+    dashscope_api_key: str = Field(..., min_length=1, description="Ключ DashScope")
+
+    #: Базовый URL шлюза Qwen (режим совместимости с OpenAI).
+    qwen_base_url: str = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        description="Базовый URL API Qwen",
+    )
+
+    # --- Модели для разных ролей -------------------------------------------
+    #: Модель-планировщик (выбирает план из цели).
+    planner_model: str = Field(
+        default="qwen-max",
+        description="Модель для роли planner",
+    )
+
+    #: Модель-ревьюер (оценивает результат выполнения шага).
+    reviewer_model: str = Field(
+        default="qwen-plus",
+        description="Модель для роли reviewer",
+    )
+
+    # --- Agnes CLI -----------------------------------------------------------
+    #: Путь к исполняемому Agnes CLI (по умолчанию ищет в PATH).
+    agnes_cli_path: str = Field(
+        default="agnes",
+        description="Путь к исполняемому файлу Agnes CLI",
+    )
+
+    #: Таймаут одного вызова Agnes (в секундах).
+    agnes_timeout: int = Field(
+        default=300,
+        gt=0,  # таймаут не может быть 0 или отрицательным
+        description="Таймаут Agnes в секундах",
+    )
+
+    # --- Целевой проект ------------------------------------------------------
+    #: Дефолтный путь к проекту, если CLI-аргумент --project не передан.
+    # ВАЖНО: значение по умолчанию — None, чтобы явная ошибка описывала
+    # отсутствие .env. CLI-парсер подставит путь из .env самостоятельно.
+    default_project_path: Optional[str] = Field(
+        default=None,
+        description="Дефолтный путь к целевому проекту (из .env)",
+    )
+
+    # --- Логирование и лимиты -------------------------------------------------
+    #: Уровень логирования (DEBUG, INFO, WARNING, ERROR, CRITICAL).
+    log_level: str = Field(default="INFO", description="Уровень логирования")
+
+    #: Максимальное число шагов плана, которое будет выполнено за один запуск.
+    max_steps: int = Field(
+        default=10,
+        gt=0,  # «10 шагов» = 10 разорванных шагов = 0 не имеет смысла
+        description="Максимальное число шагов плана",
+    )
+
+    # --- Валидаторы ---------------------------------------------------------
+
+    @field_validator("dashscope_api_key")
+    @classmethod
+    def _validate_api_key(cls, v: str) -> str:
+        """Проверяем формат ключа DashScope (начинается с 'sk-')."""
+        v = v.strip()
+        # Дешёвая проверка на явную ошибку в .env (например, оставлено "sk-...").
+        if v == "sk-..." or len(v) < 20:
+            raise ValueError(
+                "Похоже, DASHSCOPE_API_KEY пустой/заглушка. "
+                "Заполните реальным ключом DashScope."
+            )
+        return v
+
+    @field_validator("log_level", "planner_model", "reviewer_model", "qwen_base_url")
+    @classmethod
+    def _strip_strings(cls, v: str) -> str:
+        """Убираем пробелы — частая ошибка при ручном редактировании .env."""
+        return v.strip()
+
+    @field_validator("log_level")
+    @classmethod
+    def _check_log_level(cls, v: str) -> str:
+        """Лог-уровень — один из известных, иначе глупо падать при настройке."""
+        allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        v_upper = v.upper()
+        if v_upper not in allowed:
+            raise ValueError(f"LOG_LEVEL '{v}' не поддерживается. Допустимо: {sorted(allowed)}")
+        return v_upper
+
+
+def load_settings(project_path_override: Optional[Path] = None) -> Settings:
+    """Загружает :class:`Settings`, применяя переопределение пути к проекту.
+
+    :param project_path_override: Явный путь из CLI-аргумента ``--project``.
+        Если ``None`` — используется ``default_project_path`` из ``.env``.
+    :returns: Заполненный экземпляр :class:`Settings`.
+    :raises SystemExit: Если ни CLI-аргумент, ни дефолт из ``.env`` не заданы.
+    """
+    settings = Settings()
+
+    # Путь к целевому проекту: приоритет CLI > .env.
+    project: Optional[Path] = project_path_override
+    if project is None:
+        raw = settings.default_project_path
+        if raw is None or not raw.strip():
+            # Пользователь не указал --project и нет DEFAULT_PROJECT_PATH в .env.
+            raise SystemExit(
+                "Путь к целевому проекту не задан. "
+                "Передайте --project в CLI или заполните DEFAULT_PROJECT_PATH в .env."
+            )
+        project = Path(raw).expanduser().resolve()
+
+    # Проверяем, что путь существует — лучше упасть сразу с понятной ошибкой,
+    # чем через N минут работы планировщика.
+    if not project.exists():
+        raise SystemExit(f"Путь к проекту не существует: {project}")
+    if not project.is_dir():
+        raise SystemExit(f"Путь к проекту не является каталогом: {project}")
+
+    # Сохраняем валидированный путь в настройки для последующего использования.
+    object.__setattr__(settings, "default_project_path", str(project))
+    return settings
+
+
+D:\Project\OrchestratorProject>type "D:\Project\OrchestratorProject\logger_setup.py"   & echo.
+# logger_setup.py
+"""Настройка логирования для оркестратора.
+
+Структура логов для каждого запуска:
+
+    logs/run_2026-10-20_12-39-00/
+    ├── run.log                     # общий текстовый лог по всем ролям
+    ├── planner.log                 # лог агента-планировщика
+    ├── executor.log                # лог агента-исполнителя
+    ├── reviewer.log                # лог агента-ревьюера
+    └── structured_trace.jsonl      # машиночитаемые события (JSON Lines)
+
+Формат строк:
+    [YYYY-MM-DD HH:MM:SS.mmm] [ROLE/MODEL] [LEVEL] message
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+
+class RunLogPaths:
+    """Сохраняет пути к файлам логов одного запуска.
+
+    Используется оркестратором, чтобы логировать события в нужные файлы.
+    ``jsonl_path`` — для ``structured_trace.jsonl`` (JSON Lines).
+    """
+
+    def __init__(self, run_dir: Path) -> None:
+        # Общая текстовая папка запуска (создаётся при вызове setup_logger).
+        self.run_dir: Path = run_dir
+
+        #: Общий текстовый лог (все роли).
+        self.run_log: Path = run_dir / "run.log"
+
+        #: Машиночитаемый трасс-файл (JSON Lines).
+        self.jsonl_path: Path = run_dir / "structured_trace.jsonl"
+
+        #: Карта «имя агента -> путь к лог-файлу агента».
+        self.agent_logs: dict[str, Path] = {}
+
+
+def _build_role_model_formatter() -> logging.Formatter:
+    """Возвращает кастомный Formatter с обязательным форматом:
+
+        [%(asctime)s.%(msecs)03d] [%(role)s/%(model)s] [%(levelname)s] %(message)s
+
+    Замысел: обычный ``logging`` не знает полей ``role`` и ``model``.
+    Они добавляются в ``record`` на лету через ``__getattr__``. Если поле
+    отсутствует (например, системные сообщения без привязки к роли),
+    возвращаем ``-`` вместо ошибки.
+    """
+    # Регистрируем кастомный формат через formatstr — logging подставит
+    # ``%(role)s`` и ``%(model)s`` через ``__getattr__`` на record'ах.
+    fmt = "[%(asctime)s.%(msecs)03d] [%(role)s/%(model)s] [%(levelname)s] %(message)s"
+    formatter = logging.Formatter(fmt=fmt, datefmt="%Y-%m-%d %H:%M:%S")
+    return formatter
+
+
+def setup_logger(
+    name: str,
+    role: str,
+    model: str,
+    log_dir: Path,
+    level: str = "DEBUG",
+) -> logging.Logger:
+    """Создаёт логгер с текстовым и структурированным выводом.
+
+    :param name: Уникальное имя логгера (например, ``"planner"``).
+    :param role: Роль агента (``"planner"``, ``"executor"``, ``"reviewer"``).
+    :param model: Имя модели (``"qwen-max"``, ``"qwen-plus"`` или ``"agnes"``).
+    :param log_dir: Базовый каталог логов (например, ``Path("logs")``).
+        Папка ``run_<timestamp>`` создаётся автоматически.
+    :param level: Уровень логирования (``"DEBUG"``, ``"INFO"``, ...).
+    :returns: Настроенный :class:`logging.Logger` с привязкой к role/model.
+    """
+    # ---------------------------------------------------------------
+    # 1. Создаём папку запуска, если её ещё нет.
+    # ---------------------------------------------------------------
+    run_dir = log_dir / f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Регистрируем пути для текущего запуска.
+    paths = RunLogPaths(run_dir)
+
+    # ---------------------------------------------------------------
+    # 2. Общий текстовый лог (run.log) — все роли пишут сюда.
+    # ---------------------------------------------------------------
+    run_handler = logging.FileHandler(paths.run_log, encoding="utf-8")
+    run_handler.setLevel(logging.DEBUG)
+    run_handler.setFormatter(_build_role_model_formatter())
+
+    # ---------------------------------------------------------------
+    # 3. Отдельный лог для конкретного агента (planner.log, executor.log, ...)
+    # ---------------------------------------------------------------
+    agent_log_name = f"{name}.log"
+    paths.agent_logs[name] = run_dir / agent_log_name
+    agent_handler = logging.FileHandler(paths.agent_logs[name], encoding="utf-8")
+    agent_handler.setLevel(logging.DEBUG)
+    agent_handler.setFormatter(_build_role_model_formatter())
+
+    # ---------------------------------------------------------------
+    # 4. Консольный вывод (для оперативного наблюдения).
+    # ---------------------------------------------------------------
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(getattr(logging, level.upper(), logging.DEBUG))
+    console_handler.setFormatter(_build_role_model_formatter())
+
+    # ---------------------------------------------------------------
+    # 5. Создаём и настраиваем логгер.
+    # ---------------------------------------------------------------
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+
+    # Убираем дубли, если setup_logger вызывался повторно.
+    logger.handlers.clear()
+
+    # Добавляем все хендлеры.
+    logger.addHandler(run_handler)       # общий лог
+    logger.addHandler(agent_handler)     # лог конкретного агента
+    logger.addHandler(console_handler)   # консоль
+
+    # Запрещаем «пузырение» вверх — только сюда и в root.
+    logger.propagate = False
+
+    # ---------------------------------------------------------------
+    # 6. Вешаем кастомные поля role/model на все record'ы.
+    #    Ловим это через фильтр: каждый record проходит Filter,
+    #    который дописывает ``role`` и ``model``.
+    # ---------------------------------------------------------------
+    class _RoleModelFilter(logging.Filter):
+        """Добавляет атрибуты ``role`` и ``model`` в каждый ``LogRecord``.
+
+        Без этого кастомный Formatter не смог бы подставить ``%(role)s``
+        и ``%(model)s`` — а стандартные логгеры не имеют таких полей.
+        """
+
+        def __init__(self, role: str, model: str) -> None:
+            super().__init__()
+            self._role = role
+            self._model = model
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            # Если поля уже установлены (например, внешним вызовом), не пишем.
+            if not hasattr(record, "role"):
+                record.role = self._role  # type: ignore[attr-defined]
+            if not hasattr(record, "model"):
+                record.model = self._model  # type: ignore[attr-defined]
+            return True
+
+    role_model_filter = _RoleModelFilter(role, model)
+    for handler in logger.handlers:
+        handler.addFilter(role_model_filter)
+
+    # ---------------------------------------------------------------
+    # 7. Сохраняем RunLogPaths на логгере, чтобы оркестратор мог
+    #    получить путь к structured_trace.jsonl для записи событий.
+    # ---------------------------------------------------------------
+    # Типизация: логгер не знает про RunLogPaths по своей природе,
+    # поэтому вешаем атрибут с type-комментарием.
+    logger.run_paths = paths  # type: ignore[attr-defined]  # noqa: E501
+
+    # Первый лог — диагностический: подтверждает, что папка и хендлеры готовы.
+    logger.debug("Логгер '%s' (role=%s, model=%s) инициализирован: %s",
+                 name, role, model, run_dir)
+    return logger
+
+
+def emit_structured_event(
+    logger: logging.Logger,
+    event_type: str,
+    role: str,
+    model: str,
+    success: bool,
+    tokens_used: Optional[dict[str, int]] = None,
+    **extra: Any,
+) -> None:
+    """Записывает машиночитаемое событие в ``structured_trace.jsonl``.
+
+    Каждое событие — одна строка JSON:
+
+    .. code-block:: json
+
+        {"ts": "...", "event": "...", "role": "...", "model": "...",
+         "success": true, "tokens_used": {"input": N, "output": M}, ...}
+
+    :param logger: Логгер, инициализированный :func:`setup_logger`.
+    :param event_type: Тип события (``"plan_created"``, ``"step_started"``,
+        ``"step_completed"``, ``"step_failed"``, ``"review_result"``, ...).
+    :param role: Роль (``"planner"``, ``"executor"``, ``"reviewer"``).
+    :param model: Модель (``"qwen-max"``, ``"qwen-plus"``, ``"agnes-cli"``).
+    :param success: Успешно ли событие.
+    :param tokens_used: Разбивка токенов, если доступна (input/output).
+    :param extra: Произвольные дополнительные поля (step, task, error, ...).
+    """
+    # Путь к JSONL берём из привязки, наведённой в setup_logger.
+    # Если логгер не инициализирован через setup_logger — событие не пишет,
+    # но не роняет выполнение (мягкий отказ для отладки).
+    run_paths: Optional[RunLogPaths] = getattr(logger, "run_paths", None)
+    if run_paths is None:
+        logger.warning("structured_trace.jsonl недоступен: логгер не инициализирован.")
+        return
+
+    # Формируем словарик события.
+    record: dict[str, Any] = {
+        "ts": datetime.now().isoformat(timespec="milliseconds"),
+        "event": event_type,
+        "role": role,
+        "model": model,
+        "success": success,
+        "tokens_used": tokens_used,  # None, если токены не отслеживаются
+    }
+    # Добавляем дополнительные поля (step, task, error и т. д.).
+    record.update(extra)
+
+    # Пишем в JSONL (одна строка — один JSON-объект).
+    try:
+        with run_paths.jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except OSError as e:
+        # Ошибка записи — не критична для основного потока, но логгируем.
+        logger.warning("Не удалось записать в structured_trace.jsonl: %s", e)
+
+
+def create_run_logger(
+    name: str,
+    role: str,
+    model: str,
+    log_dir: Path,
+    level: str = "DEBUG",
+) -> tuple[logging.Logger, RunLogPaths]:
+    """Вспомогательная обёртка: создаёт логгер и возвращает пути.
+
+    Удобна, когда и логгер, и путь к JSONL нужны одновременно
+    (как в оркестраторе).
+
+    :returns: (logger, run_paths)
+    """
+    logger = setup_logger(name, role, model, log_dir, level)
+    paths = logger.run_paths  # type: ignore[attr-defined]
+    return logger, paths
+
+
+D:\Project\OrchestratorProject>type "D:\Project\OrchestratorProject\orchestrator.py"   & echo.
+# orchestrator.py
+"""Главный CLI-оркестратор.
+
+Точка входа: ``python orchestrator.py --project <path> --goal <file>``.
+
+Логика:
+1. Инициализация настроек (config.py) и логгеров (logger_setup.py).
+2. Чтение цели из файла, указанного через --goal.
+3. Вызов QwenPlanner для получения плана.
+4. Цикл по шагам плана (ограничение MAX_STEPS):
+   - AgnesExecutor выполняет шаг.
+   - QwenReviewer проверяет результат.
+   - Если success=False — прервать цикл с явной причиной.
+5. Печать итогового отчёта через rich.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from pathlib import Path
+from typing import Any, Optional
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+from config import Settings, load_settings
+from logger_setup import RunLogPaths, create_run_logger, emit_structured_event
+from agents.planner import QwenPlanner
+from agents.executor import AgnesExecutor
+from agents.reviewer import QwenReviewer
+from agents.base import AgentResult
+
+
+# ----------------------------------------------------------------------
+# Печать отчёта через rich
+# ----------------------------------------------------------------------
+
+def _print_summary(
+    console: Console,
+    total_steps: int,
+    completed_steps: int,
+    failure_reason: Optional[str],
+    run_paths: Optional[RunLogPaths],
+) -> None:
+    """Печатает итоговый отчёт в консоль через rich."""
+    # Таблица: сколько шагов выполнено / сколько всего.
+    table = Table(title="Оркестратор: итог")
+    table.add_column("Метрика", style="bold")
+    table.add_column("Значение")
+    table.add_row("Всего шагов в плане", str(total_steps))
+    table.add_row("Выполнено успешно", str(completed_steps))
+    table.add_row(
+        "Запущено с ошибкой",
+        "Да" if failure_reason else "Нет",
+    )
+    if failure_reason:
+        table.add_row("Причина остановки", failure_reason[:200])
+
+    console.print(table)
+
+    # Панель с путями к логам (для отладки/аудита).
+    if run_paths is not None:
+        log_lines = [
+            f"run.log: {run_paths.run_log}",
+            f"planner.log: {run_paths.agent_logs.get('planner', '—')}",
+            f"executor.log: {run_paths.agent_logs.get('executor', '—')}",
+            f"reviewer.log: {run_paths.agent_logs.get('reviewer', '—')}",
+            f"JSONL: {run_paths.jsonl_path}",
+        ]
+        console.print(Panel(
+            "\n".join(log_lines),
+            title="Логи запуска",
+            border_style="cyan",
+        ))
+
+
+# ----------------------------------------------------------------------
+# Основная логика
+# ----------------------------------------------------------------------
+
+async def run_orchestrator(
+    settings: Settings,
+    goal_text: str,
+    project_path: Path,
+) -> int:
+    """Выполняет полный цикл оркестрации.
+
+    :returns: Код возврата процесса (0 = успех, 1 = ошибка).
+    """
+    console = Console()
+
+    # --- Логгеры ----------------------------------------------------------
+    log_dir = Path("logs")
+    planner_logger, run_paths = create_run_logger(
+        name="planner",
+        role="planner",
+        model=settings.planner_model,
+        log_dir=log_dir,
+        level=settings.log_level,
+    )
+    executor_logger = planner_logger  # общий для executor (единый run_dir)
+    # Создаём отдельные логгеры, чтобы каждый агент писал в свой файл.
+    executor_logger, _ = create_run_logger(
+        name="executor",
+        role="executor",
+        model="agnes-cli",
+        log_dir=log_dir,
+        level=settings.log_level,
+    )
+    reviewer_logger, _ = create_run_logger(
+        name="reviewer",
+        role="reviewer",
+        model=settings.reviewer_model,
+        log_dir=log_dir,
+        level=settings.log_level,
+    )
+
+    planner = QwenPlanner(settings, planner_logger)
+    executor = AgnesExecutor(settings, executor_logger)
+    reviewer = QwenReviewer(settings, reviewer_logger)
+
+    # --- Событие: начало запуска ------------------------------------------
+    emit_structured_event(
+        planner_logger,
+        event_type="run_started",
+        role="orchestrator",
+        model="orchestrator",
+        success=True,
+        goal=goal_text[:200],
+        project=str(project_path),
+    )
+
+    # --- Шаг 1: Планировщик ------------------------------------------------
+    console.print("[bold cyan]→ Планировщик:[/bold cyan] формирование плана…")
+    planner_result = await planner.execute(
+        task=goal_text,
+        context={"project_path": str(project_path)},
+    )
+
+    if not planner_result.success:
+        # Планировщик не смог составить план — останавливаемся.
+        reason = planner_result.error_message or "Unknown planner error"
+        console.print(f"[bold red]✗ Ошибка планировщика:[/bold red] {reason}")
+        planner_logger.error("Планировщик не смог составить план: %s", reason)
+        emit_structured_event(
+            planner_logger,
+            event_type="plan_failed",
+            role="planner",
+            model=settings.planner_model,
+            success=False,
+            error=reason,
+            tokens_used=planner_result.tokens_used,
+        )
+        _print_summary(
+            console,
+            total_steps=0,
+            completed_steps=0,
+            failure_reason=reason,
+            run_paths=run_paths,
+        )
+        return 1
+
+    # Данные планера: список шагов.
+    plan: list[dict[str, Any]] = planner_result.data
+    total_steps: int = len(plan)
+    console.print(
+        f"[green]✓ План из {total_steps} шагов.[/green] "
+        f"(лимит MAX_STEPS={settings.max_steps})"
+    )
+
+    # --- Шаг 2: Цикл по шагам ----------------------------------------------
+    max_steps: int = settings.max_steps
+    completed_steps: int = 0
+    failure_reason: Optional[str] = None
+    failure_step: int = 0
+
+    for step_index, step in enumerate(plan, start=1):
+        # Проверка лимита.
+        if step_index > max_steps:
+            console.print(
+                f"[yellow]⚠ Достигнут лимит MAX_STEPS={max_steps}. "
+                f"Остальные {total_steps - max_steps} шагов пропущено.[/yellow]"
+            )
+            break
+
+        step_desc: str = str(step.get("description", f"Step {step_index}"))
+        target_files: list[str] = step.get("target_files", [])
+
+        console.print(
+            f"[bold]Шаг {step_index}/{min(total_steps, max_steps)}:[/bold] "
+            f"{step_desc}\n"
+            f"  Целевые файлы: {', '.join(target_files) if target_files else '—'}"
+        )
+
+        # Событие: шаг начат.
+        emit_structured_event(
+            executor_logger,
+            event_type="step_started",
+            role="executor",
+            model="agnes-cli",
+            success=True,
+            step=step_index,
+            description=step_desc,
+            target_files=target_files,
+        )
+
+        # --- 2a. Исполнитель ------------------------------------------------
+        executor_result: AgentResult = await executor.execute(
+            task=step_desc,
+            context={
+                "project_path": str(project_path),
+                "step_number": step_index,
+            },
+        )
+
+        # Если исполнитель не смог запустить процесс — фиксируем и прерываем.
+        if not executor_result.success:
+            reason = executor_result.error_message or "Executor failed"
+            failure_reason = f"Шаг {step_index}: исполнитель не завершил задачу: {reason}"
+            failure_step = step_index
+            console.print(f"[bold red]✗ {failure_reason}[/bold red]")
+            executor_logger.error(
+                "Шаг %d: исполнитель не завершил задачу: %s", step_index, reason
+            )
+            emit_structured_event(
+                executor_logger,
+                event_type="step_failed",
+                role="executor",
+                model="agnes-cli",
+                success=False,
+                step=step_index,
+                error=reason,
+            )
+            break
+
+        # --- 2b. Ревьюер ------------------------------------------------------
+        reviewer_result: AgentResult = await reviewer.execute(
+            task=step_desc,
+            context={
+                "project_path": str(project_path),
+                "step_number": step_index,
+                "executor_result": executor_result,
+            },
+        )
+
+        # Ревьюер может вернуть success=True (отработал) но data.success=False.
+        review_data: dict[str, Any] = reviewer_result.data or {}
+        review_success: bool = bool(review_data.get("success", False))
+        review_reason: str = str(review_data.get("reason", ""))
+
+        # Событие: результат ревьюера.
+        emit_structured_event(
+            reviewer_logger,
+            event_type="review_result",
+            role="reviewer",
+            model=settings.reviewer_model,
+            success=review_success,
+            step=step_index,
+            reason=review_reason,
+            tokens_used=reviewer_result.tokens_used,
+        )
+
+        if not review_success:
+            failure_reason = (
+                f"Шаг {step_index}: ревьюер не подтвердил выполнение. "
+                f"Причина: {review_reason}"
+            )
+            failure_step = step_index
+            console.print(f"[bold red]✗ {failure_reason}[/bold red]")
+            reviewer_logger.error(
+                "Шаг %d: ревьюер не подтвердил выполнение. %s", step_index, review_reason
+            )
+            break
+
+        # --- 2c. Успех шага --------------------------------------------------
+        completed_steps += 1
+        console.print(
+            f"[green]✓ Шаг {step_index} завершён.[/green] {review_reason[:100]}"
+        )
+        executor_logger.info("Шаг %d успешно завершён (review: %s)", step_index, review_reason[:100])
+
+    # --- Событие: завершение ------------------------------------------------
+    emit_structured_event(
+        planner_logger,
+        event_type="run_completed",
+        role="orchestrator",
+        model="orchestrator",
+        success=(failure_reason is None),
+        completed=completed_steps,
+        total=total_steps,
+        failure_reason=failure_reason,
+    )
+
+    # --- Итоговый отчёт -------------------------------------------------------
+    _print_summary(
+        console,
+        total_steps=total_steps,
+        completed_steps=completed_steps,
+        failure_reason=failure_reason,
+        run_paths=run_paths,
+    )
+
+    return 0 if failure_reason is None else 1
+
+
+# ----------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Разбирает аргументы командной строки.
+
+    :param argv: Список аргументов (по умолчанию sys.argv[1:]).
+    """
+    parser = argparse.ArgumentParser(
+        description="Оркестратор автоматизации задач Python-проектов.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # --project: путь к целевому проекту. Дефолт берётся из .env (DEFAULT_PROJECT_PATH).
+    # Используем default=None, чтобы отложить проверку в load_settings.
+    parser.add_argument(
+        "--project",
+        type=Path,
+        default=None,
+        help="Путь к целевому проекту (дефолт: DEFAULT_PROJECT_PATH из .env)",
+    )
+    # --goal: путь к файлу с целевым описанием (goal.txt).
+    parser.add_argument(
+        "--goal",
+        type=Path,
+        required=True,
+        help="Путь к файлу с целевым описанием задачи",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Точка входа для ``python orchestrator.py``."""
+    args = parse_args(argv)
+
+    # --- Загрузка конфигурации ---------------------------------------------
+    # project_path_override: если --project передан, используем его,
+    # иначе load_settings возьмёт DEFAULT_PROJECT_PATH из .env.
+    project_override: Optional[Path] = args.project
+    try:
+        settings = load_settings(project_path_override=project_override)
+    except SystemExit as exc:
+        # load_settings бросает SystemExit с понятным сообщением.
+        print(f"Ошибка конфигурации: {exc}", file=sys.stderr)
+        return 1
+
+    # --- Чтение цели ---------------------------------------------------------
+    goal_path: Path = args.goal
+    try:
+        goal_text: str = goal_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        print(f"Файл цели не найден: {goal_path}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"Ошибка чтения файла цели: {exc}", file=sys.stderr)
+        return 1
+
+    if not goal_text:
+        print("Файл цели пуст — нечего планировать.", file=sys.stderr)
+        return 1
+
+    # --- Запускаем асинхронный цикл ----------------------------------------
+    try:
+        return asyncio.run(
+            run_orchestrator(settings, goal_text, Path(settings.default_project_path))
+        )
+    except KeyboardInterrupt:
+        print("\nПользователь прервал выполнение (Ctrl+C).", file=sys.stderr)
+        return 130
+    except Exception as exc:  # noqa: BLE001 — конечная точка, ловим всё
+        import traceback
+        traceback.print_exc()
+        print(f"Необработанное исключение: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+D:\Project\OrchestratorProject>type "D:\Project\OrchestratorProject\agents\base.py"   & echo.. 
+# agents/base.py
+"""Базовые типы для агентов.
+
+Определяет:
+- :class:`AgentResult` — единый результат работы любого агента.
+- :class:`BaseAgent` — абстрактный базовый класс, задающий контракт
+  ``async execute(task, context) -> AgentResult``.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+
+@dataclass
+class AgentResult:
+    """Результат выполнения агентом одной задачи.
+
+    Поля:
+    - ``success`` — сработал ли агент без ошибок (например, API вернул 200,
+      subprocess завершился с кодом 0 и т. д.).
+    - ``data`` — полезная нагрузка: список шагов плана (для planner),
+      строка stdout (для executor), dict с success/reason (для reviewer).
+    - ``error_message`` — текстовое описание ошибки, если ``success=False``.
+    - ``tokens_used`` — разбивка по токенам ``{"input": N, "output": M}``,
+      если известно; ``None`` если токены не отслеживаются (например, для
+      subprocess-вызова Agnes).
+    """
+    success: bool
+    data: Any = None
+    error_message: Optional[str] = None
+    tokens_used: Optional[dict[str, int]] = field(default=None)
+
+
+class BaseAgent(ABC):
+    """Абстрактная база для всех агентов оркестратора.
+
+    Подкласс обязан реализовать :meth:`execute` — асинхронный метод,
+    принимающий строку-задачу и произвольный контекст (dict).
+    """
+
+    #: Имя агента (используется для логов).
+    name: str = "base"
+    #: Роль агента (используется для логгирования и JSONL-трассы).
+    role: str = "base"
+    #: Имя модели / инструмента (для planner/reviewer — qwen-max, qwen-plus;
+    #: для executor — agnes-cli).
+    model: str = "unknown"
+
+    @abstractmethod
+    async def execute(self, task: str, context: dict[str, Any]) -> AgentResult:
+        """Выполняет задачу и возвращает :class:`AgentResult`.
+
+        :param task: Текстовая формулировка задачи.
+        :param context: Словарь произвольных данных (путь к проекту,
+            результат предыдущего агента и т. д.).
+        """
+        raise NotImplementedError
+.
+
+D:\Project\OrchestratorProject>type "D:\Project\OrchestratorProject\agents\executor.py"   & echo.. 
+# agents/executor.py
+"""Исполнитель на базе Agnes CLI (subprocess).
+
+Выполняет один шаг плана через ``subprocess.run``::
+
+    agnes run -t "{task}" --no-session
+
+Передаёт переменную окружения ``AGNES_MODE=auto`` в отдельном ``env``.
+Обработка: таймаут, ``CalledProcessError``, отсутствие бинаря.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+from typing import Any
+
+from agents.base import AgentResult, BaseAgent
+from config import Settings
+
+
+class AgnesExecutor(BaseAgent):
+    """Исполнитель задач через Agnes CLI.
+
+    Запускает ``agnes run -t "<task>" --no-session`` в подпроцессе,
+    передавая текущее окружение + ``AGNES_MODE=auto``. Результат —
+    stdout/stderr/returncode, упакованные в :class:`AgentResult`.
+
+    :param settings: Загруженные :class:`~config.Settings`.
+    :param logger: Логгер (роль=executor, модель=agnes-cli).
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        logger: logging.Logger,
+    ) -> None:
+        super().__init__()
+        self.name = "executor"
+        self.role = "executor"
+        self.model = "agnes-cli"
+        self._settings = settings
+        self._logger = logger
+
+    async def execute(self, task: str, context: dict[str, Any]) -> AgentResult:
+        """Выполняет одну задачу через Agnes CLI.
+
+        :param task: Конкретная задача (описание шага + целевые файлы).
+        :param context: Должен содержать ``project_path`` (для работы в нём)
+            и, опционально, ``step_number``.
+        :returns: AgentResult: ``success=True`` и ``data={"stdout": ..., "stderr": ..., "returncode": ...}``.
+        """
+        project_path: str = context.get("project_path", ".")
+        step_number: int = int(context.get("step_number", 0))
+
+        self._logger.info(
+            "Шаг #%d: запуск Agnes CLI в '%s'. Задача: %s",
+            step_number,
+            project_path,
+            task[:120].replace("\n", " "),
+        )
+
+        # --- Формируем команду --------------------------------------------
+        # Используем args-список (а не shell=True), чтобы избежать инъекций.
+        # Задание передаётся через -t — оно целиком в одном аргументе,
+        # а не парсится shell'ом.
+        cmd: list[str] = [
+            self._settings.agnes_cli_path,
+            "run",
+            "-t",
+            task,
+            "--no-session",
+        ]
+
+        # --- Передаём окружение -------------------------------------------
+        # Берём текущий os.environ (чтобы PATH и др. сохранились)
+        # и добавляем AGNES_MODE=auto.
+        env = os.environ.copy()
+        env["AGNES_MODE"] = "auto"
+
+        # --- Запускаем subprocess ------------------------------------------
+        try:
+            self._logger.debug("Команда: %s", " ".join(cmd))
+            result = subprocess.run(
+                cmd,
+                cwd=project_path,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=self._settings.agnes_timeout,
+            )
+        except FileNotFoundError as exc:
+            # Бинарник Agnes не найден — путь в настройках неверный.
+            self._logger.error(
+                "Исполняемый '%s' не найден. Проверьте AGNES_CLI_PATH в .env.",
+                self._settings.agnes_cli_path,
+            )
+            return AgentResult(
+                success=False,
+                data=None,
+                error_message=(
+                    f"Agnes binary not found: {self._settings.agnes_cli_path} "
+                    f"(FileNotFoundError: {exc})"
+                ),
+            )
+        except subprocess.TimeoutExpired as exc:
+            # Таймаут: процесс мог частично выполнить работу, но мы ждём
+            # только полный результат. Фиксируем partial output, если он есть.
+            partial_stdout = (exc.stdout or "").decode("utf-8", errors="replace")
+            partial_stderr = (exc.stderr or "").decode("utf-8", errors="replace")
+            self._logger.error(
+                "Agnes не завершился за %d c (timeout). Partial stdout: %s",
+                self._settings.agnes_timeout,
+                partial_stdout[:500],
+            )
+            return AgentResult(
+                success=False,
+                data={
+                    "stdout": partial_stdout,
+                    "stderr": partial_stderr,
+                    "returncode": None,  # не завершён
+                },
+                error_message=(
+                    f"Agnes CLI timed out after {self._settings.agnes_timeout}s"
+                ),
+            )
+        except OSError as exc:
+            # Общее family OSError (например, permission denied на каталог).
+            self._logger.error("OSError при запуске Agnes: %s", exc)
+            return AgentResult(
+                success=False,
+                data=None,
+                error_message=f"OS error running Agnes: {exc}",
+            )
+
+        # --- Обработка результата ------------------------------------------
+        # subprocess.run без check=True НЕ бросает CalledProcessError
+        # при ненулевом returncode. Обрабатываем вручную через returncode.
+        data = {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+        }
+
+        if result.returncode == 0:
+            self._logger.info(
+                "Agnes завершился с кодом 0. stdout (%d симв.).",
+                len(result.stdout),
+            )
+            return AgentResult(success=True, data=data)
+
+        # Ненулевое returncode:
+        self._logger.error(
+            "Agnes завершился с кодом %d. stderr: %s",
+            result.returncode,
+            result.stderr[:500],
+        )
+        return AgentResult(
+            success=False,
+            data=data,
+            error_message=(
+                f"Agnes exited with code {result.returncode}: "
+                f"{result.stderr.strip()[:300]}"
+            ),
+        )
+.
+
+D:\Project\OrchestratorProject>type "D:\Project\OrchestratorProject\agents\planner.py"   & echo.. 
+# agents/planner.py
+"""Планировщик на базе Qwen (DashScope SDK).
+
+Отправляет цель проекту + контекст в DashScope и просит вернуть
+строго JSON-массив шагов вида::
+
+    [
+      {"step": 1, "description": "...", "target_files": ["src/x.py"]},
+      ...
+    ]
+
+Обработка: try/except вокруг json.loads с вырезанием первого
+валидного JSON-массива из ответа модели.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Optional
+
+import dashscope
+
+from agents.base import AgentResult, BaseAgent
+from config import Settings
+
+
+# Промт-система для планировщика: чётко фиксируем формат.
+_PLANNER_SYSTEM_PROMPT = """\
+You are a precise project planning agent for Python codebases.
+
+Given the goal and project context, produce a strictly valid JSON array \
+of steps. Each step is an object:
+
+    {
+        "step": <int>,              # ordinal, starting from 1
+        "description": "<short imperative sentence>",
+        "target_files": ["<path/relative/to/project>", ...]
+    }
+
+Rules:
+- Return ONLY a JSON array. No markdown, no code fences, no commentary.
+- Each step is atomic and independently verifiable.
+- target_files are relative paths from the project root.
+- Up to {max_steps} steps.
+"""
+
+
+class QwenPlanner(BaseAgent):
+    """Агент-планировщик, использующий DashScope (Qwen).
+
+    :param settings: Загруженные :class:`~config.Settings`.
+    :param logger: Логгер (роль=planner, модель=settings.planner_model).
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        logger: logging.Logger,
+    ) -> None:
+        super().__init__()
+        self.name = "planner"
+        self.role = "planner"
+        self.model = settings.planner_model
+        self._settings = settings
+        self._logger = logger
+
+        # Настраиваем DashScope SDK ключом из конфига.
+        # Это безопасно: ключ живёт в Settings, а не в коде.
+        dashscope.api_key = settings.dashscope_api_key
+
+    async def execute(self, task: str, context: dict[str, Any]) -> AgentResult:
+        """Получает план из Qwen по заданной цели.
+
+        :param task: Целевое описание (содержимое goal.txt).
+        :param context: Контекст, например ``{"project_path": "..."}``.
+        :returns: AgentResult, где ``data`` — валидный список шагов.
+        """
+        # --- Шаг 1: Подготовка промта -------------------------------------
+        project_path: Optional[str] = context.get("project_path")
+        max_steps: int = self._settings.max_steps
+
+        # Включаем в промт путь к проекту — модель должна понимать,
+        # где она будет планировать изменения (носитель target_files).
+        system_prompt = _PLANNER_SYSTEM_PROMPT.format(max_steps=max_steps)
+        user_prompt = (
+            f"Project path: {project_path}\n"
+            f"Goal:\n{task}\n\n"
+            f"Return the plan as a JSON array (up to {max_steps} steps)."
+        )
+
+        self._logger.info(
+            "Запрос к планировщику (model=%s): цель '%s' (длина=%d симв.)",
+            self.model,
+            task[:80].replace("\n", " "),
+            len(task),
+        )
+
+        # --- Шаг 2: Вызов DashScope ----------------------------------------
+        try:
+            # Держим call синхронным — SDK сам управляет HTTP-сессией.
+            # Для не-интерактивного использования достаточно одного вызова.
+            response = dashscope.Generation.call(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                result_format="message",  # отвечаем как OpenAI-совместимый
+                temperature=0.2,        # строгий план — низкая температура
+            )
+        except Exception as exc:
+            # Ошибки сети / API (429, 500, таймаут, неверный ключ и т. п.).
+            # Логируем с деталями и возвращаем результат без success.
+            self._logger.error("ОШИБКА DashScope API: %s", exc)
+            return AgentResult(
+                success=False,
+                data=None,
+                error_message=f"DashScope API error: {exc}",
+            )
+
+        # --- Шаг 3: Извлекаем текст ответа модели --------------------------
+        # response.output — контейнер. Для result_format="message" в
+        # output.choices[0].message.content находится текст.
+        try:
+            choices = response.output.choices
+            if not choices:
+                raise ValueError("DashScope вернул пустой список choices")
+            raw_response_text: str = choices[0].message.content or ""
+        except (IndexError, AttributeError) as exc:
+            # Формат ответа несовместим с ожиданиями — считаем ошибкой.
+            self._logger.error("Неверный формат ответа DashScope: %s", exc)
+            return AgentResult(
+                success=False,
+                data=None,
+                error_message=f"Unexpected response shape: {exc}",
+            )
+
+        if not raw_response_text.strip():
+            # Модель «промолчала» — считаем неудачей.
+            self._logger.error("Планировщик вернул пустой ответ.")
+            return AgentResult(
+                success=False,
+                data=None,
+                error_message="Planner returned empty response",
+            )
+
+        self._logger.debug(
+            "Сырой ответ планировщика (%d симв.): %s",
+            len(raw_response_text),
+            raw_response_text[:200],
+        )
+
+        # --- Шаг 4: Парсим JSON -------------------------------------------
+        try:
+            plan: list[dict[str, Any]] = self._parse_json_array(
+                raw_response_text
+            )
+        except json.JSONDecodeError as exc:
+            # Критический случай: модель не дала валидный JSON.
+            # Логируем текст, чтобы постфактум понять, что она «сказала».
+            self._logger.error(
+                "JSON-декодирование плана НЕ УДАЛОСЬ: %s\nСырой текст:\n%s",
+                exc,
+                raw_response_text,
+            )
+            return AgentResult(
+                success=False,
+                data=None,
+                error_message=(
+                    f"Planner returned invalid JSON: {exc.msg} "
+                    f"at position {exc.pos}"
+                ),
+                # Токены, если DashScope их предоставил (даже при ошибке).
+                tokens_used=self._extract_tokens(response),
+            )
+        except (ValueError, TypeError) as exc:
+            # Некорректные данные (например, элементы не dict).
+            self._logger.error("Планировщик вернул некорректные данные: %s", exc)
+            return AgentResult(
+                success=False,
+                data=None,
+                error_message=f"Invalid plan structure: {exc}",
+                tokens_used=self._extract_tokens(response),
+            )
+
+        self._logger.info(
+            "План сформирован: %d шагов. Перечень: %s",
+            len(plan),
+            [p.get("description", "")[:50] for p in plan],
+        )
+
+        # --- Шаг 5: Возвращаем результат ----------------------------------
+        return AgentResult(
+            success=True,
+            data=plan,
+            tokens_used=self._extract_tokens(response),
+        )
+
+    # ------------------------------------------------------------------
+    # Вспомогательные методы
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_json_array(text: str) -> list[dict[str, Any]]:
+        """Извлекает JSON-массив из ответа модели.
+
+        Модель может обернуть массив в markdown-блоки или написать
+        комментарий «Вот план:». Поэтому вырезаем первый
+        подстроковый участок между первой '[' и последней ']',
+        затем парсим его.
+
+        :raises ValueError: если массив не найден или элементы не dict.
+        """
+        # Ищем от первого '[' до последнего ']' — простейший и надёжный
+        # способ «вырезать» массив даже с мусором вокруг.
+        start = text.find("[")
+        end = text.rfind("]")
+        if start == -1 or end == -1 or end < start:
+            raise ValueError("JSON array not found in model response")
+
+        json_fragment = text[start : end + 1]
+        parsed = json.loads(json_fragment)
+
+        # Убеждаемся, что это список и каждый элемент — dict.
+        if not isinstance(parsed, list):
+            raise ValueError("Model returned a non-array JSON")
+        for i, item in enumerate(parsed):
+            if not isinstance(item, dict):
+                raise ValueError(f"Step #{i} is not a dict: {type(item).__name__}")
+
+        return parsed
+
+    @staticmethod
+    def _extract_tokens(response: Any) -> Optional[dict[str, int]]:
+        """Достаёт разбивку по токенам из ответа DashScope.
+
+        Структура: response.usage.{input_tokens, output_tokens}.
+        Если поле отсутствует — возвращаем None.
+        """
+        try:
+            usage = getattr(response, "usage", None)
+            if usage is None:
+                return None
+            # DashScope отдаёт input_tokens/output_tokens (не prompt/completion).
+            return {
+                "input": int(usage.input_tokens),
+                "output": int(usage.output_tokens),
+            }
+        except (AttributeError, TypeError, ValueError):
+            # Токены — мета-данные; их отсутствие не должно ронять план.
+            return None
+.
+
+D:\Project\OrchestratorProject>type "D:\Project\OrchestratorProject\agents\reviewer.py"   & echo.. 
+# agents/reviewer.py
+"""Ревьюер на базе Qwen (DashScope SDK).
+
+Принимает на вход задачу и результат исполнителя и спрашивает у модели::
+
+    Выполнена ли задача успешно?
+    Верни JSON: {"success": true/false, "reason": "..."}
+
+Обработка: try/except вокруг json.loads.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Optional
+
+import dashscope
+
+from agents.base import AgentResult, BaseAgent
+from config import Settings
+
+
+# Промт-система: чётко фиксируем формат ответа.
+_REVIEWER_SYSTEM_PROMPT = """\
+You are a strict code review agent for automated task execution.
+
+Given a task and the execution result (stdout/stderr/returncode), \
+determine whether the task was completed successfully.
+
+Return ONLY a JSON object of the form:
+
+    {"success": true, "reason": "<short explanation>"}
+
+or
+
+    {"success": false, "reason": "<short explanation>"}
+
+Rules:
+- Be strict: if the output shows errors, missing changes, or incomplete
+  work, mark it as unsuccessful.
+- reason must be a single sentence.
+- No markdown, no commentary, no extra keys.
+"""
+
+
+class QwenReviewer(BaseAgent):
+    """Агент-ревьюер, использующий DashScope (Qwen).
+
+    :param settings: Загруженные :class:`~config.Settings`.
+    :param logger: Логгер (роль=reviewer, модель=settings.reviewer_model).
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        logger: logging.Logger,
+    ) -> None:
+        super().__init__()
+        self.name = "reviewer"
+        self.role = "reviewer"
+        self.model = settings.reviewer_model
+        self._settings = settings
+        self._logger = logger
+
+        # DashScope API-ключ устанавливается по тому же образцу, что
+        # и в планировщике — SDK хранит его модульным полном.
+        dashscope.api_key = settings.dashscope_api_key
+
+    async def execute(
+        self,
+        task: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Оценивает результат выполнения задачи.
+
+        :param task: Конкретная задача (шаг).
+        :param context: Должен содержать:
+            - ``executor_result`` — AgentResult от исполнителя (или
+              словарь с stdout/stderr/returncode).
+        :returns: AgentResult, где ``data`` — ``{"success": bool, "reason": str}``.
+        """
+        executor_result: Optional[AgentResult] = context.get("executor_result")
+        step_number: int = int(context.get("step_number", 0))
+
+        # --- Готовим payload для промта -----------------------------------
+        # Executor может вернуться с success=True и с success=False (например,
+        # процесс упал, но stderr содержит подсказки). Передаём сырые данные.
+        exec_data = executor_result.data if executor_result else None
+        exec_error = executor_result.error_message if executor_result else "no executor result"
+
+        task_block = f"Task:\n{task}"
+
+        # Экранируем длинные stdout/stderr, чтобы не раздувать промт.
+        exec_block = self._format_executor_output(exec_data, exec_error)
+
+        user_prompt = (
+            f"{task_block}\n\n"
+            f"Execution result:\n{exec_block}\n\n"
+            f"Was the task completed successfully? "
+            f'Return JSON: {{"success": true/false, "reason": "..."}}'
+        )
+
+        self._logger.info(
+            "Шаг #%d: запрос к ревьюеру (model=%s).",
+            step_number,
+            self.model,
+        )
+
+        # --- Вызов DashScope ------------------------------------------------
+        try:
+            response = dashscope.Generation.call(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": _REVIEWER_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                result_format="message",
+                temperature=0.1,  # ревьюер строгий — минимальная температура
+            )
+        except Exception as exc:
+            # Ошибка API — считаем ревью не пройденным, возвращаем явную ошибку.
+            self._logger.error("ОШИБКА DashScope API в ревьюере: %s", exc)
+            return AgentResult(
+                success=False,
+                data={"success": False, "reason": "DashScope API error"},
+                error_message=f"DashScope API error: {exc}",
+            )
+
+        # --- Извлекаем текст ------------------------------------------------
+        try:
+            choices = response.output.choices
+            if not choices:
+                raise ValueError("DashScope returned empty choices")
+            raw_response_text: str = choices[0].message.content or ""
+        except (IndexError, AttributeError) as exc:
+            self._logger.error("Неверный формат ответа в ревьюере: %s", exc)
+            return AgentResult(
+                success=False,
+                data={"success": False, "reason": "Malformed API response"},
+                error_message=f"Unexpected response shape: {exc}",
+            )
+
+        if not raw_response_text.strip():
+            self._logger.error("Ревьюер вернул пустой ответ.")
+            return AgentResult(
+                success=False,
+                data={"success": False, "reason": "Empty reviewer response"},
+                error_message="Reviewer returned empty response",
+            )
+
+        # --- Парсим JSON ----------------------------------------------------
+        try:
+            review = self._parse_review_json(raw_response_text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._logger.error(
+                "Не удалось распарсить JSON ревьюера: %s\nСырой текст:\n%s",
+                exc,
+                raw_response_text,
+            )
+            return AgentResult(
+                success=False,
+                data={"success": False, "reason": f"Invalid reviewer JSON: {exc}"},
+                error_message=f"Reviewer returned invalid JSON: {exc}",
+                tokens_used=self._extract_tokens(response),
+            )
+
+        # --- Интерпретация ---------------------------------------------------
+        is_success: bool = bool(review.get("success", False))
+        reason: str = str(review.get("reason", "(no reason provided)"))
+
+        self._logger.info(
+            "Шаг #%d: ревьюер -> success=%s, reason: %s",
+            step_number,
+            is_success,
+            reason[:120],
+        )
+
+        # Вернуть:
+        # - ``success`` самого AgentResult — отработал ли ревьюер корректно
+        #   (JSON распарсился), что всегда True в этом месте.
+        # - ``data`` — сам вердикт ревьюера (success + reason).
+        return AgentResult(
+            success=True,  # ревьюер отработал
+            data=review,
+            tokens_used=self._extract_tokens(response),
+        )
+
+    # ------------------------------------------------------------------
+    # Вспомогательные
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_executor_output(
+        data: Optional[dict[str, Any]],
+        error_message: Optional[str],
+    ) -> str:
+        """Форматирует данные от исполнителя в компактный текст для промта."""
+        if data is None and error_message:
+            return f"ERROR: {error_message}"
+
+        if data is None:
+            return "(no execution data)"
+
+        parts: list[str] = []
+        stdout = str(data.get("stdout", "")).strip()
+        stderr = str(data.get("stderr", "")).strip()
+        returncode = data.get("returncode")
+
+        # Обрезаем слишком длинные блоки, чтобы не раздувать промт.
+        stdout = stdout[:3000] if len(stdout) > 3000 else stdout
+        stderr = stderr[:1500] if len(stderr) > 1500 else stderr
+
+        if stdout:
+            parts.append(f"stdout:\n{stdout}")
+        if stderr:
+            parts.append(f"stderr:\n{stderr}")
+        parts.append(f"returncode: {returncode}")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _parse_review_json(text: str) -> dict[str, Any]:
+        """Извлекает JSON-объект из ответа модели.
+
+        Модель может обернуть объект в markdown-блоки. Вырезаем первый
+        '{' и последний '}', затем парсим.
+
+        :raises ValueError: если объект не найден или нет нужных ключей.
+        """
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            raise ValueError("JSON object not found in reviewer response")
+
+        json_fragment = text[start : end + 1]
+        parsed = json.loads(json_fragment)
+
+        if not isinstance(parsed, dict):
+            raise ValueError("Reviewer response is not a JSON object")
+        if "success" not in parsed:
+            raise ValueError('Reviewer response missing "success" key')
+
+        return parsed
+
+    @staticmethod
+    def _extract_tokens(response: Any) -> Optional[dict[str, int]]:
+        """Достаёт разбивку по токенам из ответа DashScope (input/output)."""
+        try:
+            usage = getattr(response, "usage", None)
+            if usage is None:
+                return None
+            return {
+                "input": int(usage.input_tokens),
+                "output": int(usage.output_tokens),
+            }
+        except (AttributeError, TypeError, ValueError):
+            # Токены — мета-данные; их отсутствие не должно ронять ревью.
+            return None
+.
+
+D:\Project\OrchestratorProject>type "D:\Project\OrchestratorProject\agents\__init__.py"   & echo.. 
+# agents/__init__.py
+"""Пакет агентов: планировщик, исполнитель, ревьюер."""
+
+from agents.base import AgentResult, BaseAgent
+from agents.planner import QwenPlanner
+from agents.executor import AgnesExecutor
+from agents.reviewer import QwenReviewer
+
+__all__ = [
+    "AgentResult",
+    "BaseAgent",
+    "QwenPlanner",
+    "AgnesExecutor",
+    "QwenReviewer",
+]
+.

@@ -1,0 +1,13 @@
+# requirements.txt
+# Минимальный набор зависимостей для оркестратора.
+# Все пакеты — официально поддерживаемые, без «тяжёлых» фреймворков.
+
+# Клиент OpenAI-совместимого API (работает с OpenRouter, OpenAI, vLLM, etc.)
+openai>=1.30.0
+
+dashscope>=1.20.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+python-dotenv>=1.0.1
+rich>=13.7.0
+httpx>=0.27.0
