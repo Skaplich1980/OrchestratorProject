@@ -1,12 +1,14 @@
 # agents/executor.py
-"""Исполнитель через Agnes CLI (subprocess).
+"""Исполнитель на базе Agnes CLI (subprocess).
 
-Особенности:
-  1. Бэкапы файлов из target_files ПЕРЕД запуском (если ENABLE_BACKUPS=true).
-  2. Генерация .agneshints в целевом проекте (если отсутствует) —
-     это локальный контекст Agnes, он приоритетнее глобального.
-  3. AGNES_MOIM_MESSAGE_TEXT — персистентный guardrail, инжектится каждый ход
-     (Agnes его не «забудет» при заполнении контекста).
+Выполняет один шаг плана через команду:
+  agnes run "<task>" --model <model> --auto
+
+Ключевые особенности:
+1. Передача AGNES_API_KEY через переменную окружения subprocess.
+2. Флаг --auto для автоматического подтверждения прав на изменение файлов.
+3. Бэкапы целевых файлов перед выполнением (если включено в настройках).
+4. Создание .agneshints для контекста проекта.
 """
 from __future__ import annotations
 
@@ -19,18 +21,6 @@ from typing import Any
 
 from agents.base import AgentResult, BaseAgent
 from config import Settings
-
-# Guardrail — инжектится КАЖДЫЙ ход через AGNES_MOIM_MESSAGE_TEXT.
-# Agnes не может его «забыть» при заполнении контекста.
-_GUARDRAIL_TEXT = (
-    "AUTOMATED ORCHESTRATION MODE.\n"
-    "Rules:\n"
-    "1. Execute ONLY the task given. Do not refactor unrelated code.\n"
-    "2. Keep changes minimal and atomic.\n"
-    "3. Do not create new files unless the task explicitly requires it.\n"
-    "4. Do not run destructive commands (rm -rf, drop table, etc.).\n"
-    "5. If unsure — make the smallest safe change.\n"
-)
 
 # Локальный .agneshints — если его нет в проекте, создадим дефолтный.
 _DEFAULT_AGNESHINTS = (
@@ -47,7 +37,7 @@ class AgnesExecutor(BaseAgent):
         super().__init__()
         self.name = "executor"
         self.role = "executor"
-        self.model = "agnes-cli"
+        self.model = settings.agnes_model
         self._settings = settings
         self._logger = logger
 
@@ -56,15 +46,9 @@ class AgnesExecutor(BaseAgent):
         project_path: Path = Path(project_path_str)
         step_number: int = int(context.get("step_number", 0))
         target_files: list[str] = list(context.get("target_files", []) or [])
-        # Каталог бэкапов текущего запуска (может не быть — тогда пропускаем).
         backups_dir: str | None = context.get("backups_dir")
 
-        self._logger.info(
-            "Шаг #%d: запуск Agnes CLI в '%s'.",
-            step_number,
-            project_path,
-        )
-        # Глубокое логирование промта для Agnes.
+        self._logger.info("Шаг #%d: запуск Agnes CLI в '%s'.", step_number, project_path)
         self._logger.debug("--- ЗАДАЧА (PROMPT) ДЛЯ AGNES ---\n%s", task)
 
         # --- 1. БЕКАПЫ перед правками -----------------------------------
@@ -72,24 +56,22 @@ class AgnesExecutor(BaseAgent):
             self._backup_files(project_path, target_files, Path(backups_dir), step_number)
 
         # --- 2. .agneshints в целевом проекте ---------------------------
-        # Agnes Code загружает <корень_проекта>/.agneshints при старте сессии.
-        # Создаём, если отсутствует — чтобы Agnes понимал контекст.
         self._ensure_agneshints(project_path)
 
         # --- 3. Формируем команду ---------------------------------------
-        # args-список (без shell=True) — защита от инъекций.
+        # ИСПРАВЛЕНИЕ: сообщение передаётся как позиционный аргумент [message..],
+        # а не через --prompt. Добавляем --model и --auto.
         cmd: list[str] = [
             self._settings.agnes_cli_path,
             "run",
-            "-t",
-            task,
-            "--no-session",  # изолированный контекст, без истории между шагами
+            task,  # <-- Позиционный аргумент (сообщение)
+            "--model", self._settings.agnes_model,
+            "--auto",  # КРИТИЧЕСКИ ВАЖНО: авто-подтверждение изменений
         ]
 
-        # --- 4. Окружение: AGNES_MODE=auto + guardrail ------------------
+        # --- 4. Окружение: инжектируем API ключ -------------------------
         env = os.environ.copy()
-        env["AGNES_MODE"] = "auto"  # полностью автоматический режим
-        env["AGNES_MOIM_MESSAGE_TEXT"] = _GUARDRAIL_TEXT  # персистентные правила
+        env["AGNES_API_KEY"] = self._settings.agnes_api_key
 
         # --- 5. Запуск subprocess ---------------------------------------
         try:
@@ -105,25 +87,16 @@ class AgnesExecutor(BaseAgent):
                 errors="replace",
             )
         except FileNotFoundError as exc:
-            self._logger.error(
-                "Agnes не найден по пути '%s'. Проверь AGNES_CLI_PATH в .env.",
-                self._settings.agnes_cli_path,
-            )
+            self._logger.error("Agnes не найден по пути '%s'.", self._settings.agnes_cli_path)
             return AgentResult(
-                success=False,
-                data=None,
-                error_message=(
-                    f"Agnes binary not found: {self._settings.agnes_cli_path} ({exc})"
-                ),
+                success=False, data=None,
+                error_message=f"Agnes binary not found: {self._settings.agnes_cli_path} ({exc})"
             )
         except subprocess.TimeoutExpired as exc:
             partial_out = self._coerce_text(exc.stdout)
             partial_err = self._coerce_text(exc.stderr)
-            self._logger.error(
-                "Agnes не завершился за %d c. Partial stdout: %s",
-                self._settings.agnes_timeout,
-                partial_out[:500],
-            )
+            self._logger.error("Agnes не завершился за %d c. Partial stdout: %s", self._settings.agnes_timeout,
+                               partial_out[:500])
             return AgentResult(
                 success=False,
                 data={"stdout": partial_out, "stderr": partial_err, "returncode": None},
@@ -134,75 +107,54 @@ class AgnesExecutor(BaseAgent):
             return AgentResult(success=False, data=None, error_message=f"OS error: {exc}")
 
         # --- 6. Разбор результата ---------------------------------------
-        data = {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode,
-        }
+        data = {"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
+
         if result.returncode == 0:
             self._logger.info("Agnes: code=0, stdout=%d симв.", len(result.stdout))
             return AgentResult(success=True, data=data)
 
-        self._logger.error(
-            "Agnes: code=%d, stderr=%s",
-            result.returncode,
-            result.stderr[:500],
-        )
+        self._logger.error("Agnes: code=%d, stderr=%s", result.returncode, result.stderr[:500])
         return AgentResult(
-            success=False,
-            data=data,
-            error_message=(
-                f"Agnes exited with code {result.returncode}: "
-                f"{result.stderr.strip()[:300]}"
-            ),
+            success=False, data=data,
+            error_message=f"Agnes exited with code {result.returncode}: {result.stderr.strip()[:300]}"
         )
 
     # ----------------------------------------------------------------
-    # Вспомогательные
+    # Вспомогательные методы
     # ----------------------------------------------------------------
-    def _backup_files(
-        self,
-        project_path: Path,
-        target_files: list[str],
-        backups_dir: Path,
-        step_number: int,
-    ) -> None:
+    def _backup_files(self, project_path: Path, target_files: list[str], backups_dir: Path, step_number: int) -> None:
         """Копирует целевые файлы в backups/step_N/ перед правками."""
         step_backup = backups_dir / f"step_{step_number:03d}"
         try:
             step_backup.mkdir(parents=True, exist_ok=True)
             copied = 0
             for rel in target_files:
+                if not rel or rel in (".", "./"):
+                    continue  # Пропускаем корень проекта
+
                 src = project_path / rel
-                if not src.exists():
-                    # Файл ещё не создан — шаг, вероятно, его создаст.
-                    self._logger.debug("Бэкап: '%s' не существует — пропускаем.", rel)
-                    continue
+                if not src.exists() or src.is_dir():
+                    continue  # Пропускаем несуществующие файлы и директории
+
                 dst = step_backup / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)  # copy2 сохраняет метаданные
+                shutil.copy2(src, dst)
                 copied += 1
-            self._logger.info(
-                "Шаг #%d: сделан бэкап %d файл(ов) в %s",
-                step_number,
-                copied,
-                step_backup,
-            )
+
+            if copied > 0:
+                self._logger.info("Шаг #%d: сделан бэкап %d файл(ов) в %s", step_number, copied, step_backup)
         except OSError as e:
-            # Бэкап — не критичен, но логируем явно.
             self._logger.warning("Шаг #%d: сбой бэкапа: %s", step_number, e)
 
     @staticmethod
     def _ensure_agneshints(project_path: Path) -> None:
         """Создаёт <проект>/.agneshints, если его нет."""
         hints = project_path / ".agneshints"
-        if hints.exists():
-            return
-        try:
-            hints.write_text(_DEFAULT_AGNESHINTS, encoding="utf-8")
-        except OSError:
-            # Если не смогли создать — не страшно, Agnes просто не получит контекст.
-            pass
+        if not hints.exists():
+            try:
+                hints.write_text(_DEFAULT_AGNESHINTS, encoding="utf-8")
+            except OSError:
+                pass
 
     @staticmethod
     def _coerce_text(value: Any) -> str:

@@ -129,7 +129,7 @@ class QwenPlanner(BaseAgent):
                             {"role": "user", "content": user_prompt},
                         ],
                         temperature=0.2,
-                        max_tokens=2000,
+                        max_tokens=10000,
                     )
 
                     raw_text = response.choices[0].message.content or ""

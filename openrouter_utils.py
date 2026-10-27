@@ -8,6 +8,15 @@ from typing import Optional
 logger = logging.getLogger("openrouter_utils")
 
 
+# Черный список: модели, которые не подходят для генерации кода/текста
+# или блокируют прямой API-доступ.
+BLACKLIST_KEYWORDS = [
+    "thinkingmachines",  # блокируют прямой API (требуют UI)
+    "lyria",             # Google Lyria — генерация музыки/аудио
+    "image", "video", "audio", "music", "tts", "whisper" # мультимодальные
+]
+
+
 async def get_free_models(
         sort_by: str = "context_length",
         limit: int = 5,
@@ -36,9 +45,13 @@ async def get_free_models(
             # Проверяем, что и вход, и выход бесплатны (строка "0")
             if str(pricing.get("prompt", "1")) == "0" and str(pricing.get("completion", "1")) == "0":
                 model_id = model.get("id", "")
+                model_id_lower = model_id.lower()
 
                 # НОВОЕ: Игнорируем модели, блокирующие прямой API-доступ
                 if "thinkingmachines" in model_id.lower():
+                    continue
+                # Пропускаем модели из черного списка
+                if any(kw in model_id_lower for kw in BLACKLIST_KEYWORDS):
                     continue
 
                 context_length = model.get("context_length", 0)

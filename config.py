@@ -26,9 +26,11 @@ class Settings(BaseSettings):
     deepseek_api_key: Optional[str] = Field(default=None)
     deepseek_base_url: str = Field(default="https://api.deepseek.com")
 
-    agnes_api_key: Optional[str] = Field(default=None)
-    agnes_cli_path: str = Field(default="agnes")
-    agnes_timeout: int = Field(default=300, gt=0)
+    # --- AGNES CLI -----------------------------------------------------------
+    agnes_api_key: str = Field(..., min_length=1, description="API ключ Agnes")
+    agnes_cli_path: str = Field(default="agnes", description="Путь к исполняемому файлу Agnes CLI")
+    agnes_model: str = Field(default="agnes/agnes-2.5-flash", description="Модель Agnes для выполнения")
+    agnes_timeout: int = Field(default=300, gt=0, description="Таймаут Agnes в секундах")
 
     # --- МОДЕЛИ И FALLBACK (читаем как строку, чтобы избежать JSON-ошибок pydantic-settings) ---
     fallback_planner_models_str: str = Field(
@@ -77,6 +79,14 @@ class Settings(BaseSettings):
         if v_upper not in allowed:
             raise ValueError(f"LOG_LEVEL '{v}' недопустим. Разрешено: {sorted(allowed)}")
         return v_upper
+
+    @field_validator("agnes_api_key")
+    @classmethod
+    def _validate_agnes_key(cls, v: str) -> str:
+        v = v.strip()
+        if not v or len(v) < 10:
+            raise ValueError("AGNES_API_KEY пустой или слишком короткий.")
+        return v
 
 
 def load_settings(project_path_override: Optional[Path] = None) -> Settings:
