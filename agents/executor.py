@@ -180,23 +180,39 @@ class AgnesExecutor(BaseAgent):
             self._logger.warning("Шаг #%d: сбой бэкапа: %s", step_number, e)
 
     def _write_agneshints(
-        self,
-        project_path: Path,
-        final_prompt: str,
-        step_number: int,
+            self,
+            project_path: Path,
+            final_prompt: str,
+            step_number: int,
     ) -> None:
-        """Пишет финальный промт + глобальные правила в <project>/.agneshints.
-
-        Локальный .agneshints имеет для Agnes высший приоритет, поэтому
-        перезапись гарантирует, что исполнитель увидит именно наши правила.
-        При ошибке записи не падаем — только предупреждаем в лог.
+        """Автоматически создаёт/обновляет .agneshints в целевом проекте.
+        Объединяет глобальные правила оркестратора с промтом текущего шага.
         """
         hints_path = project_path / ".agneshints"
+
+        # 1. Читаем глобальные правила из корня оркестратора
+        orchestrator_root = Path(__file__).resolve().parent.parent
+        global_hints_path = orchestrator_root / "global_agneshints.txt"
+
+        global_rules = ""
+        if global_hints_path.exists():
+            global_rules = global_hints_path.read_text(encoding="utf-8").strip() + "\n\n"
+        else:
+            self._logger.warning("Глобальный файл global_agneshints.txt не найден в %s", orchestrator_root)
+
+        # 2. Формируем итоговый контент: Глобальные правила + Контекст шага
+        content_to_write = (
+            f"{global_rules}"
+            f"--- КОНТЕКСТ И ЗАДАЧА ТЕКУЩЕГО ШАГА #{step_number} ---\n"
+            f"{final_prompt}"
+        )
+
+        # 3. Записываем в целевой проект
         try:
-            hints_path.write_text(final_prompt, encoding="utf-8")
+            hints_path.write_text(content_to_write, encoding="utf-8")
             self._logger.debug(
-                "Шаг #%d: .agneshints обновлён (%d симв.) по пути %s",
-                step_number, len(final_prompt), hints_path,
+                "Шаг #%d: .agneshints обновлён в проекте (%d симв.) по пути %s",
+                step_number, len(content_to_write), hints_path,
             )
         except OSError as e:
             self._logger.warning(

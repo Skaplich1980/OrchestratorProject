@@ -144,8 +144,7 @@ class QwenReviewer(BaseAgent):
         self._logger.error(error_msg)
         return AgentResult(success=False, data={"success": False, "reason": error_msg}, error_message=error_msg)
 
-    @staticmethod
-    def _format_executor_output(data: Optional[dict[str, Any]], error_message: Optional[str]) -> str:
+    def _format_executor_output(self, data: Optional[dict[str, Any]], error_message: Optional[str]) -> str:
         """Форматирует данные от исполнителя, используя умное усечение."""
         if data is None and error_message:
             return f"ERROR: {error_message}"
@@ -156,7 +155,7 @@ class QwenReviewer(BaseAgent):
         stderr = str(data.get("stderr", "")).strip()
         returncode = data.get("returncode")
 
-        truncated_output = smart_truncate_output(stdout, stderr, max_length=3000)
+        truncated_output = smart_truncate_output(stdout, stderr, max_length=self._settings.reviewer_max_output_length)
         parts = [truncated_output] if truncated_output else []
         parts.append(f"returncode: {returncode}")
         return "\n".join(parts)

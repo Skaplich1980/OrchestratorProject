@@ -19,13 +19,19 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
+
     # --- ПЛАНИРОВЩИК ---------------------------------------------------
     planner_provider: str = Field(default="qwengate", description="qwengate или openrouter")
 
-    # QwenGate настройки
-    qwengate_base_url: str = Field(default="http://localhost:26405/v1")
-    qwengate_api_key: str = Field(default="not-needed")
-    qwengate_model: str = Field(default="qwen-max")
+    # =========================================================
+    # НАСТРОЙКИ РЕВЬЮЕРА
+    # =========================================================
+    reviewer_max_output_length: int = Field(
+        default=4000,
+        gt=500,
+        alias="REVIEWER_MAX_OUTPUT_LENGTH",
+        description="Максимальная длина вывода stdout/stderr для анализа ревьюером"
+    )
 
     # OpenRouter настройки (для fallback или если выбран openrouter)
     openrouter_api_key: str = Field(..., min_length=1)

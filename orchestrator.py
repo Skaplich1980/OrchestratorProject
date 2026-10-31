@@ -88,6 +88,15 @@ async def run_orchestrator(settings: Settings, goal_text: str, project_path: Pat
     executor_logger = setup_agent_logger("executor", "executor", "agnes-cli", run_paths, settings.log_level)
     reviewer_logger = setup_agent_logger("reviewer", "reviewer", "dynamic", run_paths, settings.log_level)
 
+    # --- НОВОЕ: Явное логирование контекста запуска ---
+    planner_logger.info("=" * 70)
+    planner_logger.info("🚀 ЗАПУСК ОРКЕСТРАТОРА")
+    planner_logger.info("📁 Целевой проект : %s", settings.default_project_path)
+    planner_logger.info("🎯 Исходная цель  :\n%s", goal_text)
+    planner_logger.info("=" * 70)
+    # ------------------------------------------------
+
+
     # --- 3. PromptManager: единая точка сборки промтов -----------------
     if not PROMPTS_DIR.exists():
         planner_logger.warning(
@@ -287,8 +296,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--goal",
         type=Path,
-        required=True,
-        help="Путь к файлу с целевым описанием задачи (goal.txt)",
+        default=Path("goal.txt"),  # по умолчанию ищем в папке оркестратора
+        help="Путь к файлу с целевым описанием задачи (по умолчанию: goal.txt в папке оркестратора)",
     )
     return parser.parse_args(argv)
 

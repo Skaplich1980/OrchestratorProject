@@ -1,5 +1,8 @@
-python orchestrator.py --goal "D:\Project\garden_helper\goal.txt"
+@echo off
+echo ============================================================
+echo   Запуск Оркестратора
+call .venv\Scripts\activate
+python orchestrator.py
 echo ============================================================
 echo   Завершено
-echo ============================================================
 pause

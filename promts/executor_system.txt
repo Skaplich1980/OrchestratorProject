@@ -14,3 +14,8 @@ You must follow the CLEAN CODE PRINCIPLES defined in the global rules (smallest 
 
 ## GLOBAL RULES
 {global_rules}
+
+## FINAL CONFIRMATION (REQUIRED)
+Before finishing, state explicitly in your final message whether the task was completed successfully.
+If you could not complete it, say so clearly and briefly explain what blocked you.
+Do not claim success unless all changes were actually made.
