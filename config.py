@@ -1,8 +1,8 @@
 # config.py
-"""Конфигурация оркестратора с поддержкой fallback-моделей."""
+"""Конфигурация оркестратора с поддержкой QwenGate и OpenRouter fallback."""
 from __future__ import annotations
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 try:
     from pydantic import Field, field_validator
@@ -19,28 +19,51 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # --- API КЛЮЧИ ---
+    # --- ПЛАНИРОВЩИК ---------------------------------------------------
+    planner_provider: str = Field(default="qwengate", description="qwengate или openrouter")
+
+    # QwenGate настройки
+    qwengate_base_url: str = Field(default="http://localhost:26405/v1")
+    qwengate_api_key: str = Field(default="not-needed")
+    qwengate_model: str = Field(default="qwen-max")
+
+    # OpenRouter настройки (для fallback или если выбран openrouter)
     openrouter_api_key: str = Field(..., min_length=1)
     openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1")
 
-    deepseek_api_key: Optional[str] = Field(default=None)
-    deepseek_base_url: str = Field(default="https://api.deepseek.com")
-
-    # --- AGNES CLI -----------------------------------------------------------
+    # --- AGNES CLI -----------------------------------------------------
     agnes_api_key: str = Field(..., min_length=1, description="API ключ Agnes")
     agnes_cli_path: str = Field(default="agnes", description="Путь к исполняемому файлу Agnes CLI")
-    agnes_model: str = Field(default="agnes/agnes-2.5-flash", description="Модель Agnes для выполнения")
+    agnes_model: str = Field(default="agnes/agnes-2.5-flash", description="Модель Agnes")
     agnes_timeout: int = Field(default=300, gt=0, description="Таймаут Agnes в секундах")
 
-    # --- МОДЕЛИ И FALLBACK (читаем как строку, чтобы избежать JSON-ошибок pydantic-settings) ---
+    # --- МОДЕЛИ И FALLBACK ---------------------------------------------
     fallback_planner_models_str: str = Field(
-        default="qwen/qwen-2.5-72b-instruct,deepseek/deepseek-chat",
+        default="qwen/qwen-2.5-72b-instruct",
         alias="FALLBACK_PLANNER_MODELS"
     )
     fallback_reviewer_models_str: str = Field(
-        default="qwen/qwen-2.5-72b-instruct,deepseek/deepseek-chat",
+        default="qwen/qwen-2.5-72b-instruct",
         alias="FALLBACK_REVIEWER_MODELS"
     )
+
+    # --- РОУТЕРЫ И МОДЕЛИ ---------------------------------------------
+    priority_keywords_str: str = Field(
+        default="qwen3, deepseek-v3, qwen-2.5-72b",
+        alias="PRIORITY_KEYWORDS",
+    )
+    models_cache_path: str = Field(
+        default="./models_cache.json",
+        alias="MODELS_CACHE_PATH",
+    )
+
+    # OrcaRouter (приоритет 0)
+    orcarouter_api_key: str = Field(default="", alias="ORCAROUTER_API_KEY")
+    orcarouter_base_url: str = Field(
+        default="https://api.orcarouter.ai/v1", alias="ORCAROUTER_BASE_URL"
+    )
+
+    max_replan_attempts: int = Field(default=2, gt=0, description="Максимум попыток перепланирования одного шага")
 
     @property
     def planner_models(self) -> list[str]:
@@ -50,25 +73,62 @@ class Settings(BaseSettings):
     def reviewer_models(self) -> list[str]:
         return [m.strip() for m in self.fallback_reviewer_models_str.split(",") if m.strip()]
 
-    # --- ПРОЕКТ И ЛИМИТЫ ---
+    @property
+    def priority_keywords(self) -> list[str]:
+        """Список приоритетных ключевых слов для подбора моделей (разбит по запятой, strip)."""
+        return [k.strip() for k in self.priority_keywords_str.split(",") if k.strip()]
+
+    @property
+    def routers_config(self) -> list[dict]:
+        """Список роутеров в порядке приоритета (0 — высший).
+
+        Включает только те роутеры, для которых задан API-ключ.
+        Каждый элемент: {name, base_url, api_key, priority}.
+        """
+        routers: list[dict] = []
+        if self.orcarouter_api_key:
+            routers.append({
+                "name": "orcarouter",
+                "base_url": self.orcarouter_base_url,
+                "api_key": self.orcarouter_api_key,
+                "priority": 0,
+            })
+        if self.openrouter_api_key:
+            routers.append({
+                "name": "openrouter",
+                "base_url": self.openrouter_base_url,
+                "api_key": self.openrouter_api_key,
+                "priority": 1,
+            })
+        routers.sort(key=lambda r: r["priority"])
+        return routers
+
+    # --- ПРОЕКТ И ЛИМИТЫ -----------------------------------------------
     default_project_path: Optional[str] = Field(default=None)
     log_level: str = Field(default="INFO")
     max_steps: int = Field(default=10, gt=0)
-
     max_retries: int = Field(default=2, gt=0)
     retry_delay: float = Field(default=5.0, gt=0)
     retry_backoff: float = Field(default=2.0, gt=1.0)
     delay_between_calls: float = Field(default=5.0, gt=0)
-
     enable_backups: bool = Field(default=True)
     backup_dir: str = Field(default="./backups")
 
-    @field_validator("openrouter_api_key")
+    # --- ВАЛИДАТОРЫ ----------------------------------------------------
+    @field_validator("planner_provider")
     @classmethod
-    def _validate_openrouter_key(cls, v: str) -> str:
+    def _validate_provider(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in {"qwengate", "openrouter"}:
+            raise ValueError("PLANNER_PROVIDER должен быть 'qwengate' или 'openrouter'")
+        return v
+
+    @field_validator("openrouter_api_key", "agnes_api_key")
+    @classmethod
+    def _validate_keys(cls, v: str) -> str:
         v = v.strip()
-        if not v or len(v) < 20:
-            raise ValueError("OPENROUTER_API_KEY пустой или является заглушкой.")
+        if not v or len(v) < 10:
+            raise ValueError("API ключ пустой или слишком короткий.")
         return v
 
     @field_validator("log_level")
@@ -79,14 +139,6 @@ class Settings(BaseSettings):
         if v_upper not in allowed:
             raise ValueError(f"LOG_LEVEL '{v}' недопустим. Разрешено: {sorted(allowed)}")
         return v_upper
-
-    @field_validator("agnes_api_key")
-    @classmethod
-    def _validate_agnes_key(cls, v: str) -> str:
-        v = v.strip()
-        if not v or len(v) < 10:
-            raise ValueError("AGNES_API_KEY пустой или слишком короткий.")
-        return v
 
 
 def load_settings(project_path_override: Optional[Path] = None) -> Settings:
@@ -105,5 +157,5 @@ def load_settings(project_path_override: Optional[Path] = None) -> Settings:
     if not project.is_dir():
         raise SystemExit(f"Путь к проекту не является каталогом: {project}")
 
-    object.__setattr__(settings, "default_project_path", str(project))
+    settings.default_project_path = str(project)
     return settings

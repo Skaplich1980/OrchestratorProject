@@ -2,16 +2,19 @@
 """Исполнитель на базе Agnes CLI (subprocess).
 
 Выполняет один шаг плана через команду:
-  agnes run "<task>" --model <model> --auto
+  agnes run "<prompt>" --model <model> --auto
 
 Ключевые особенности:
-1. Передача AGNES_API_KEY через переменную окружения subprocess.
-2. Флаг --auto для автоматического подтверждения прав на изменение файлов.
-3. Бэкапы целевых файлов перед выполнением (если включено в настройках).
-4. Создание .agneshints для контекста проекта.
+1. Промт собирается через PromptManager (без хардкода в .py).
+2. Передача AGNES_API_KEY через переменную окружения subprocess.
+3. Флаг --auto для автоматического подтверждения прав на изменение файлов.
+4. Бэкапы целевых файлов перед выполнением (если включено в настройках).
+5. Финальный промт записывается в <project>/.agneshints, чтобы Agnes
+   гарантированно его "увидел" (локальный .agneshints имеет приоритет).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -21,25 +24,25 @@ from typing import Any
 
 from agents.base import AgentResult, BaseAgent
 from config import Settings
-
-# Локальный .agneshints — если его нет в проекте, создадим дефолтный.
-_DEFAULT_AGNESHINTS = (
-    "This is a Python project under automated orchestration.\n"
-    "Follow the project's existing code style.\n"
-    "Prefer minimal, atomic changes.\n"
-)
+from prompt_manager import PromptManager
 
 
 class AgnesExecutor(BaseAgent):
     """Исполнитель задач через Agnes CLI."""
 
-    def __init__(self, settings: Settings, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        logger: logging.Logger,
+        prompt_manager: PromptManager,
+    ) -> None:
         super().__init__()
         self.name = "executor"
         self.role = "executor"
         self.model = settings.agnes_model
         self._settings = settings
         self._logger = logger
+        self._prompt_manager = prompt_manager
 
     async def execute(self, task: str, context: dict[str, Any]) -> AgentResult:
         project_path_str: str = context.get("project_path", ".")
@@ -47,45 +50,64 @@ class AgnesExecutor(BaseAgent):
         step_number: int = int(context.get("step_number", 0))
         target_files: list[str] = list(context.get("target_files", []) or [])
         backups_dir: str | None = context.get("backups_dir")
+        step_info: str = str(context.get("step_info", "") or "")
 
         self._logger.info("Шаг #%d: запуск Agnes CLI в '%s'.", step_number, project_path)
-        self._logger.debug("--- ЗАДАЧА (PROMPT) ДЛЯ AGNES ---\n%s", task)
 
-        # --- 1. БЕКАПЫ перед правками -----------------------------------
+        # --- 1. Сборка финального промта через PromptManager -----------
+        final_prompt: str = self._prompt_manager.build_executor_prompt(
+            task=task,
+            target_files=target_files,
+            step_info=step_info,
+        )
+        # INFO-уровень: в executor.log всегда виден ровно тот текст,
+        # который уйдёт в `agnes run`.
+        self._logger.info(
+            "--- ФИНАЛЬНЫЙ ПРОМТ ДЛЯ AGNES (шаг #%d) ---\n%s",
+            step_number,
+            final_prompt,
+        )
+
+        # --- 2. БЕКАПЫ перед правками -----------------------------------
         if self._settings.enable_backups and backups_dir is not None and target_files:
             self._backup_files(project_path, target_files, Path(backups_dir), step_number)
 
-        # --- 2. .agneshints в целевом проекте ---------------------------
-        self._ensure_agneshints(project_path)
+        # --- 3. .agneshints в целевом проекте ---------------------------
+        # Пишем именно финальный промт + глобальные правила,
+        # чтобы Agnes гарантированно их учёл.
+        self._write_agneshints(project_path, final_prompt, step_number)
 
-        # --- 3. Формируем команду ---------------------------------------
-        # ИСПРАВЛЕНИЕ: сообщение передаётся как позиционный аргумент [message..],
-        # а не через --prompt. Добавляем --model и --auto.
+        # --- 4. Формируем команду ---------------------------------------
         cmd: list[str] = [
             self._settings.agnes_cli_path,
             "run",
-            task,  # <-- Позиционный аргумент (сообщение)
+            final_prompt,  # позиционный аргумент (сообщение)
             "--model", self._settings.agnes_model,
-            "--auto",  # КРИТИЧЕСКИ ВАЖНО: авто-подтверждение изменений
+            "--auto",  # авто-подтверждение изменений
         ]
 
-        # --- 4. Окружение: инжектируем API ключ -------------------------
+        # --- 5. Окружение: инжектируем API ключ -------------------------
         env = os.environ.copy()
         env["AGNES_API_KEY"] = self._settings.agnes_api_key
 
-        # --- 5. Запуск subprocess ---------------------------------------
+        # --- 6. Запуск subprocess (асинхронно, чтобы не блокировать event loop) ----
         try:
-            self._logger.debug("Команда: %s", " ".join(cmd))
-            result = subprocess.run(
-                cmd,
-                cwd=str(project_path),
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=self._settings.agnes_timeout,
-                encoding="utf-8",
-                errors="replace",
-            )
+            self._logger.debug("Команда: %s", " ".join(cmd[:3]) + " ...")
+
+            def _run_subprocess() -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    cmd,
+                    cwd=str(project_path),
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=self._settings.agnes_timeout,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, _run_subprocess)
         except FileNotFoundError as exc:
             self._logger.error("Agnes не найден по пути '%s'.", self._settings.agnes_cli_path)
             return AgentResult(
@@ -95,8 +117,10 @@ class AgnesExecutor(BaseAgent):
         except subprocess.TimeoutExpired as exc:
             partial_out = self._coerce_text(exc.stdout)
             partial_err = self._coerce_text(exc.stderr)
-            self._logger.error("Agnes не завершился за %d c. Partial stdout: %s", self._settings.agnes_timeout,
-                               partial_out[:500])
+            self._logger.error(
+                "Agnes не завершился за %d c. Partial stdout: %s",
+                self._settings.agnes_timeout, partial_out[:500],
+            )
             return AgentResult(
                 success=False,
                 data={"stdout": partial_out, "stderr": partial_err, "returncode": None},
@@ -106,7 +130,7 @@ class AgnesExecutor(BaseAgent):
             self._logger.error("OSError при запуске Agnes: %s", exc)
             return AgentResult(success=False, data=None, error_message=f"OS error: {exc}")
 
-        # --- 6. Разбор результата ---------------------------------------
+        # --- 7. Разбор результата ---------------------------------------
         data = {"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
 
         if result.returncode == 0:
@@ -122,7 +146,13 @@ class AgnesExecutor(BaseAgent):
     # ----------------------------------------------------------------
     # Вспомогательные методы
     # ----------------------------------------------------------------
-    def _backup_files(self, project_path: Path, target_files: list[str], backups_dir: Path, step_number: int) -> None:
+    def _backup_files(
+        self,
+        project_path: Path,
+        target_files: list[str],
+        backups_dir: Path,
+        step_number: int,
+    ) -> None:
         """Копирует целевые файлы в backups/step_N/ перед правками."""
         step_backup = backups_dir / f"step_{step_number:03d}"
         try:
@@ -142,19 +172,37 @@ class AgnesExecutor(BaseAgent):
                 copied += 1
 
             if copied > 0:
-                self._logger.info("Шаг #%d: сделан бэкап %d файл(ов) в %s", step_number, copied, step_backup)
+                self._logger.info(
+                    "Шаг #%d: сделан бэкап %d файл(ов) в %s",
+                    step_number, copied, step_backup,
+                )
         except OSError as e:
             self._logger.warning("Шаг #%d: сбой бэкапа: %s", step_number, e)
 
-    @staticmethod
-    def _ensure_agneshints(project_path: Path) -> None:
-        """Создаёт <проект>/.agneshints, если его нет."""
-        hints = project_path / ".agneshints"
-        if not hints.exists():
-            try:
-                hints.write_text(_DEFAULT_AGNESHINTS, encoding="utf-8")
-            except OSError:
-                pass
+    def _write_agneshints(
+        self,
+        project_path: Path,
+        final_prompt: str,
+        step_number: int,
+    ) -> None:
+        """Пишет финальный промт + глобальные правила в <project>/.agneshints.
+
+        Локальный .agneshints имеет для Agnes высший приоритет, поэтому
+        перезапись гарантирует, что исполнитель увидит именно наши правила.
+        При ошибке записи не падаем — только предупреждаем в лог.
+        """
+        hints_path = project_path / ".agneshints"
+        try:
+            hints_path.write_text(final_prompt, encoding="utf-8")
+            self._logger.debug(
+                "Шаг #%d: .agneshints обновлён (%d симв.) по пути %s",
+                step_number, len(final_prompt), hints_path,
+            )
+        except OSError as e:
+            self._logger.warning(
+                "Шаг #%d: не удалось обновить .agneshints (%s): %s",
+                step_number, hints_path, e,
+            )
 
     @staticmethod
     def _coerce_text(value: Any) -> str:

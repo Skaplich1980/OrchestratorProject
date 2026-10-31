@@ -1,0 +1,5 @@
+prompts/
++-- global_rules.md          # Жёсткие правила для всех запусков
++-- planner_system.txt       # Шаблон промта планировщика
++-- executor_system.txt      # Шаблон промта для Agnes
+L-- reviewer_system.txt      # Шаблон промта ревьюера

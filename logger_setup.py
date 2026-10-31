@@ -101,7 +101,10 @@ def setup_agent_logger(
 
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
-    # Если setup вызван повторно — чистим старые хендлеры, чтобы не дублировать строки.
+    # Если setup вызван повторно — закрываем старые хендлеры (чтобы не было утечки FD),
+    # чтобы не дублировать строки.
+    for h in logger.handlers:
+        h.close()
     logger.handlers.clear()
     logger.addHandler(run_handler)
     logger.addHandler(agent_handler)

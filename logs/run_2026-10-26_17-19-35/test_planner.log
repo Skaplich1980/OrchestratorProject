@@ -1,3 +1,0 @@
-[2026-10-26 17:19:35.450] [planner/dynamic] [DEBUG] Логгер 'test_planner' (role=planner, model=dynamic) → logs\run_2026-10-26_17-19-35
-[2026-10-26 17:19:35.519] [planner/dynamic] [INFO] Поиск бесплатных моделей OpenRouter...
-[2026-10-26 17:19:35.953] [planner/dynamic] [INFO] ✅ Используются бесплатные модели: ['thinkingmachines/inkling-small:free', 'thinkingmachines/inkling:free', 'google/lyria-3-pro-preview', 'google/lyria-3-clip-preview', 'nvidia/nemotron-3.5-super-vl:free']

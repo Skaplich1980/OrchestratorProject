@@ -1,3 +1,0 @@
-[2026-10-26 17:49:01.328] [planner/dynamic] [DEBUG] Логгер 'planner' (role=planner, model=dynamic) → logs\run_2026-10-26_17-49-01
-[2026-10-26 17:49:01.329] [executor/agnes-cli] [DEBUG] Логгер 'executor' (role=executor, model=agnes-cli) → logs\run_2026-10-26_17-49-01
-[2026-10-26 17:49:01.329] [reviewer/dynamic] [DEBUG] Логгер 'reviewer' (role=reviewer, model=dynamic) → logs\run_2026-10-26_17-49-01

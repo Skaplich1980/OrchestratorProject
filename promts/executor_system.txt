@@ -1,0 +1,16 @@
+{task}
+
+Target files: {target_files}
+{step_info}
+
+## CRITICAL EXECUTION RULES
+1. STRICT ADHERENCE: Execute ONLY the exact task described.
+2. READ vs WRITE: If the task is to "Explore", "Read", or "Analyze", you are in READ-ONLY mode. DO NOT create, modify, or delete files. Output findings to stdout only.
+3. ATOMICITY: Modify ONLY the files explicitly listed in Target files.
+4. SAFETY: Never run destructive commands. If unsure, make the smallest possible safe change.
+
+## CODE QUALITY STANDARDS
+You must follow the CLEAN CODE PRINCIPLES defined in the global rules (smallest edit, strict typing, idempotency, boundary discipline).
+
+## GLOBAL RULES
+{global_rules}
