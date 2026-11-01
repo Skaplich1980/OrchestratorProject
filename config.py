@@ -1,5 +1,5 @@
 # config.py
-"""Конфигурация оркестратора с поддержкой QwenGate и OpenRouter fallback."""
+"""Конфигурация оркестратора: мульти-роутерный fallback (OrcaRouter → OpenRouter)."""
 from __future__ import annotations
 from pathlib import Path
 from typing import Optional
@@ -20,12 +20,7 @@ class Settings(BaseSettings):
     )
 
 
-    # --- ПЛАНИРОВЩИК ---------------------------------------------------
-    planner_provider: str = Field(default="qwengate", description="qwengate или openrouter")
-
-    # =========================================================
-    # НАСТРОЙКИ РЕВЬЮЕРА
-    # =========================================================
+    # --- НАСТРОЙКИ РЕВЬЮЕРА ------------------------------------------------
     reviewer_max_output_length: int = Field(
         default=4000,
         gt=500,
@@ -33,7 +28,8 @@ class Settings(BaseSettings):
         description="Максимальная длина вывода stdout/stderr для анализа ревьюером"
     )
 
-    # OpenRouter настройки (для fallback или если выбран openrouter)
+    # --- OPENROUTER (fallback-роутер, приоритет 1) ------------------------
+    # Используется в Settings.routers_config → ModelResolver. НЕ удалять.
     openrouter_api_key: str = Field(..., min_length=1)
     openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1")
 
@@ -42,16 +38,6 @@ class Settings(BaseSettings):
     agnes_cli_path: str = Field(default="agnes", description="Путь к исполняемому файлу Agnes CLI")
     agnes_model: str = Field(default="agnes/agnes-2.5-flash", description="Модель Agnes")
     agnes_timeout: int = Field(default=300, gt=0, description="Таймаут Agnes в секундах")
-
-    # --- МОДЕЛИ И FALLBACK ---------------------------------------------
-    fallback_planner_models_str: str = Field(
-        default="qwen/qwen-2.5-72b-instruct",
-        alias="FALLBACK_PLANNER_MODELS"
-    )
-    fallback_reviewer_models_str: str = Field(
-        default="qwen/qwen-2.5-72b-instruct",
-        alias="FALLBACK_REVIEWER_MODELS"
-    )
 
     # --- РОУТЕРЫ И МОДЕЛИ ---------------------------------------------
     priority_keywords_str: str = Field(
@@ -70,14 +56,6 @@ class Settings(BaseSettings):
     )
 
     max_replan_attempts: int = Field(default=2, gt=0, description="Максимум попыток перепланирования одного шага")
-
-    @property
-    def planner_models(self) -> list[str]:
-        return [m.strip() for m in self.fallback_planner_models_str.split(",") if m.strip()]
-
-    @property
-    def reviewer_models(self) -> list[str]:
-        return [m.strip() for m in self.fallback_reviewer_models_str.split(",") if m.strip()]
 
     @property
     def priority_keywords(self) -> list[str]:
@@ -121,14 +99,6 @@ class Settings(BaseSettings):
     backup_dir: str = Field(default="./backups")
 
     # --- ВАЛИДАТОРЫ ----------------------------------------------------
-    @field_validator("planner_provider")
-    @classmethod
-    def _validate_provider(cls, v: str) -> str:
-        v = v.strip().lower()
-        if v not in {"qwengate", "openrouter"}:
-            raise ValueError("PLANNER_PROVIDER должен быть 'qwengate' или 'openrouter'")
-        return v
-
     @field_validator("openrouter_api_key", "agnes_api_key")
     @classmethod
     def _validate_keys(cls, v: str) -> str:

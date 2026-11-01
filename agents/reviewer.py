@@ -5,7 +5,7 @@
 from __future__ import annotations
 import json
 import logging
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from openai import AsyncOpenAI, APIError, APIConnectionError, APITimeoutError, RateLimitError
 
@@ -13,7 +13,12 @@ from agents.base import AgentResult, BaseAgent
 from config import Settings
 from model_resolver import ModelResolver
 
-_REVIEWER_SYSTEM_PROMPT = """\
+if TYPE_CHECKING:
+    from prompt_manager import PromptManager
+
+
+# Fallback на случай, если prompt_manager не передан (старые вызовы, тесты).
+_FALLBACK_REVIEWER_SYSTEM_PROMPT = """\
 You are a strict code review agent.
 Given a task and the execution result (stdout/stderr/returncode), determine
 whether the task was completed successfully.
@@ -27,12 +32,18 @@ Rules:
 
 
 def smart_truncate_output(stdout: str, stderr: str, max_length: int = 4000) -> str:
-    """Умно усекает вывод: всегда сохраняет stderr, обрезает хвост stdout."""
+    """Умно усекает вывод: сохраняет начало и конец stderr (где Traceback и финальная ошибка)."""
     if not stdout and not stderr:
         return ""
+
     if stderr:
         if len(stderr) >= max_length:
-            return "..." + stderr[-(max_length - 3):]
+            # Берём первые 500 символов (Traceback) + последние 1000 символов (финальная ошибка)
+            head = stderr[:500]
+            tail = stderr[-1000:]
+            skipped_lines = stderr.count("\n") - head.count("\n") - tail.count("\n")
+            return f"{head}\n...[пропущено {skipped_lines} строк]...\n{tail}"
+
         available_for_stdout = max_length - len(stderr) - 15
         if available_for_stdout > 0 and stdout:
             truncated = stdout[-available_for_stdout:]
@@ -40,6 +51,7 @@ def smart_truncate_output(stdout: str, stderr: str, max_length: int = 4000) -> s
                 return f"...{truncated}\n---ERR---\n{stderr}"
             return f"{stdout}\n---ERR---\n{stderr}"
         return stderr
+
     if len(stdout) > max_length:
         return "..." + stdout[-(max_length - 3):]
     return stdout
@@ -48,13 +60,19 @@ def smart_truncate_output(stdout: str, stderr: str, max_length: int = 4000) -> s
 class QwenReviewer(BaseAgent):
     """Агент-ревьюер."""
 
-    def __init__(self, settings: Settings, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        logger: logging.Logger,
+        prompt_manager: Optional["PromptManager"] = None,
+    ) -> None:
         super().__init__()
         self.name = "reviewer"
         self.role = "reviewer"
         self.model = "dynamic"
         self._settings = settings
         self._logger = logger
+        self._prompt_manager = prompt_manager
         self._resolver = ModelResolver(settings)
 
     async def execute(self, task: str, context: dict[str, Any]) -> AgentResult:
@@ -72,6 +90,12 @@ class QwenReviewer(BaseAgent):
 
         self._logger.info("Шаг #%d: запрос к ревьюеру", step_number)
         self._logger.debug("--- ПРОМТ РЕВЬЮЕРА ---\n%s", user_prompt)
+
+        # Системный промт из PromptManager (единая точка), иначе — fallback
+        if self._prompt_manager is not None:
+            system_prompt = self._prompt_manager.build_reviewer_system_prompt()
+        else:
+            system_prompt = _FALLBACK_REVIEWER_SYSTEM_PROMPT
 
         execution_queue = self._resolver.get_execution_queue()
         if not execution_queue:
@@ -99,7 +123,7 @@ class QwenReviewer(BaseAgent):
                 response = await client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": _REVIEWER_SYSTEM_PROMPT},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
                     temperature=0.1,

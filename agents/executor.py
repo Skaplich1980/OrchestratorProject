@@ -78,13 +78,38 @@ class AgnesExecutor(BaseAgent):
         self._write_agneshints(project_path, final_prompt, step_number)
 
         # --- 4. Формируем команду ---------------------------------------
-        cmd: list[str] = [
-            self._settings.agnes_cli_path,
-            "run",
-            final_prompt,  # позиционный аргумент (сообщение)
-            "--model", self._settings.agnes_model,
-            "--auto",  # авто-подтверждение изменений
-        ]
+        # Защита от лимита длины CLI в Windows (~8191 символ):
+        # если промт длинный, записываем его во временный файл в корне проекта
+        # и передаём через stdin, чтобы не превышать ограничение ОС.
+        PROMPT_LENGTH_LIMIT = 7000  # С запасом под Windows
+
+        if len(final_prompt) > PROMPT_LENGTH_LIMIT:
+            # Записываем промт во временный файл в проекте
+            temp_prompt_file = project_path / ".agnes_task.md"
+            temp_prompt_file.write_text(final_prompt, encoding="utf-8")
+            self._logger.info(
+                "Шаг #%d: промт слишком длинный (%d симв.), записан в %s",
+                step_number, len(final_prompt), temp_prompt_file,
+            )
+
+            # Передаём промт через stdin (Agnes должен поддерживать чтение из stdin)
+            cmd: list[str] = [
+                self._settings.agnes_cli_path,
+                "run",
+                "--model", self._settings.agnes_model,
+                "--auto",
+            ]
+            stdin_data: str | None = final_prompt
+        else:
+            # Короткий промт — передаём как позиционный аргумент
+            cmd = [
+                self._settings.agnes_cli_path,
+                "run",
+                final_prompt,
+                "--model", self._settings.agnes_model,
+                "--auto",
+            ]
+            stdin_data = None
 
         # --- 5. Окружение: инжектируем API ключ -------------------------
         env = os.environ.copy()
@@ -104,6 +129,7 @@ class AgnesExecutor(BaseAgent):
                     timeout=self._settings.agnes_timeout,
                     encoding="utf-8",
                     errors="replace",
+                    input=stdin_data,  # Передаём промт через stdin, если он длинный
                 )
 
             loop = asyncio.get_running_loop()
@@ -163,6 +189,24 @@ class AgnesExecutor(BaseAgent):
                     continue  # Пропускаем корень проекта
 
                 src = project_path / rel
+
+                # ЗАЩИТА ОТ PATH TRAVERSAL: проверяем, что файл внутри проекта
+                try:
+                    src_resolved = src.resolve()
+                    project_resolved = project_path.resolve()
+                    if not src_resolved.is_relative_to(project_resolved):
+                        self._logger.warning(
+                            "Шаг #%d: пропущен файл '%s' — путь выходит за пределы проекта (защита от path traversal)",
+                            step_number, rel,
+                        )
+                        continue
+                except (OSError, ValueError) as e:
+                    self._logger.warning(
+                        "Шаг #%d: не удалось проверить путь '%s': %s. Файл пропущен.",
+                        step_number, rel, e,
+                    )
+                    continue
+
                 if not src.exists() or src.is_dir():
                     continue  # Пропускаем несуществующие файлы и директории
 
@@ -180,25 +224,22 @@ class AgnesExecutor(BaseAgent):
             self._logger.warning("Шаг #%d: сбой бэкапа: %s", step_number, e)
 
     def _write_agneshints(
-            self,
-            project_path: Path,
-            final_prompt: str,
-            step_number: int,
+        self,
+        project_path: Path,
+        final_prompt: str,
+        step_number: int,
     ) -> None:
         """Автоматически создаёт/обновляет .agneshints в целевом проекте.
         Объединяет глобальные правила оркестратора с промтом текущего шага.
         """
         hints_path = project_path / ".agneshints"
 
-        # 1. Читаем глобальные правила из корня оркестратора
-        orchestrator_root = Path(__file__).resolve().parent.parent
-        global_hints_path = orchestrator_root / "global_agneshints.txt"
-
-        global_rules = ""
-        if global_hints_path.exists():
-            global_rules = global_hints_path.read_text(encoding="utf-8").strip() + "\n\n"
+        # 1. Получаем глобальные правила через PromptManager (единая точка истины)
+        global_rules = self._prompt_manager.get_global_rules()
+        if global_rules:
+            global_rules = global_rules.strip() + "\n\n"
         else:
-            self._logger.warning("Глобальный файл global_agneshints.txt не найден в %s", orchestrator_root)
+            self._logger.warning("Глобальные правила не найдены в PromptManager")
 
         # 2. Формируем итоговый контент: Глобальные правила + Контекст шага
         content_to_write = (

@@ -2,8 +2,11 @@
 import asyncio
 import logging
 from pathlib import Path
+from unittest.mock import MagicMock
+
 from config import load_settings
 from logger_setup import create_run_directory, setup_agent_logger
+from prompt_manager import PromptManager
 from agents.executor import AgnesExecutor
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -14,7 +17,9 @@ async def main():
     run_paths = create_run_directory(Path("logs"))
     logger = setup_agent_logger("executor", "executor", settings.agnes_model, run_paths, "DEBUG")
 
-    executor = AgnesExecutor(settings, logger)
+    prompt_manager = MagicMock(spec=PromptManager)
+    prompt_manager.build_executor_prompt.return_value = "test prompt"
+    executor = AgnesExecutor(settings, logger, prompt_manager)
 
     # Простая тестовая задача
     task = "Создай файл test_agnes.txt с текстом 'Agnes работает через оркестратор!'"

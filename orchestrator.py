@@ -108,8 +108,8 @@ async def run_orchestrator(settings: Settings, goal_text: str, project_path: Pat
     # --- 4. Создание агентов с инъекцией PromptManager -----------------
     planner = QwenPlanner(settings, planner_logger, prompt_manager)
     executor = AgnesExecutor(settings, executor_logger, prompt_manager)
-    # Reviewer пока без PromptManager — перепишем отдельным шагом.
-    reviewer = QwenReviewer(settings, reviewer_logger)
+    # Reviewer получает PromptManager (единая точка сборки системного промта).
+    reviewer = QwenReviewer(settings, reviewer_logger, prompt_manager)
 
     emit_structured_event(
         planner_logger, "run_started", "orchestrator", "orchestrator", True,
@@ -159,7 +159,7 @@ async def run_orchestrator(settings: Settings, goal_text: str, project_path: Pat
         while replan_attempts <= settings.max_replan_attempts:
             step_info: str = (
                 f"Step {step_index} of {min(len(plan), max_steps)}. "
-                f"Original plan description: {current_step_desc}"
+                f"Current step description: {current_step_desc}"
             )
 
             console.print(

@@ -115,6 +115,37 @@ class PromptManager:
             global_rules=self._global_rules,
         )
 
+    # ------------------------------------------------------------------
+    # REVIEWER
+    # ------------------------------------------------------------------
+    def build_reviewer_system_prompt(self) -> str:
+        """Загружает системный промт для ревьюера из файла reviewer_system.txt.
+
+        Если файл отсутствует, используется встроенный fallback-шаблон,
+        чтобы ревьюер продолжал работать даже без внешних шаблонов.
+        """
+        template = self._load_text("reviewer_system.txt")
+        if not template:
+            template = (
+                "You are a strict code review agent.\n"
+                "Given a task and the execution result (stdout/stderr/returncode), determine\n"
+                "whether the task was completed successfully.\n"
+                'Return ONLY a JSON object:\n'
+                '{"success": true/false, "reason": "<short explanation>"}\n'
+                "Rules:\n"
+                "- Be strict: errors, missing changes, incomplete work → success=false.\n"
+                "- reason must be a single sentence.\n"
+                "- No markdown, no commentary, no extra keys.\n"
+            )
+        return template
+
     def get_global_rules(self) -> str:
-        """Возвращает глобальные правила (для записи в .agneshints)."""
-        return self._global_rules
+        """Возвращает глобальные правила для Agnes из файла global_agneshints.txt.
+
+        Читает файл из корня оркестратора (parent от prompts_dir).
+        Если файл отсутствует, возвращает пустую строку.
+        """
+        global_hints_path = self.prompts_dir.parent / "global_agneshints.txt"
+        if global_hints_path.exists():
+            return global_hints_path.read_text(encoding="utf-8")
+        return ""
