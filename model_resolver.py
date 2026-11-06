@@ -22,12 +22,15 @@ KNOWN_FREE_MODELS = {
         "orcarouter/qwen-2.5-72b-free",
         "orcarouter/qwen3-free",
         "orcarouter/deepseek-r1-free",
+        "orca/orcacyber-flash-1.0-free",  # ← новая кибермодель
     ],
     "openrouter": [
         "qwen/qwen-2.5-72b-instruct:free",
         "deepseek/deepseek-chat:free",
         "qwen/qwen-3-32b:free",
         "deepseek/deepseek-r1:free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",  # ← Nemotron для планирования
+        "nvidia/nemotron-3.5-lightning:free",      # ← быстрая модель
     ]
 }
 
@@ -172,20 +175,33 @@ class ModelResolver:
         return execution_queue
 
     def _fetch_models_from_router(self, router: Dict[str, Any]) -> List[str]:
-        """Пытается получить список моделей через API, иначе возвращает известный список."""
+        """Получает ТОЛЬКО бесплатные модели роутера через openrouter_utils.
+
+        Использует синхронную обёртку get_free_model_ids, которая:
+        1. Делает HTTP-запрос к /models эндпоинту роутера
+        2. Фильтрует по суффиксам :free и -free
+        3. Фильтрует по pricing.prompt == '0' И pricing.completion == '0'
+        4. Исключает чёрный список (thinkingmachines, мультимодальные)
+        5. Фильтрует по min_context_length
+        """
         try:
-            from openai import OpenAI
-            sync_client = OpenAI(
-                api_key=router["api_key"],
+            from openrouter_utils import get_free_model_ids
+            model_ids = get_free_model_ids(
                 base_url=router["base_url"],
-                timeout=10.0,
+                api_key=router["api_key"],
+                sort_by="context_length",
+                limit=50,  # С запасом — дальнейшая фильтрация по keywords
+                min_context_length=16000,  # Для ревьюера хватит 16K
             )
-            response = sync_client.models.list()
-            model_ids = [m.id for m in response.data]
-            logger.info(f"Роутер {router['name']}: получено {len(model_ids)} моделей через API.")
+            logger.info(
+                "Роутер %s: получено %d бесплатных моделей через openrouter_utils.",
+                router["name"], len(model_ids),
+            )
             return model_ids
-        except Exception as e:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
-                f"Не удалось получить список моделей от {router['name']} через API ({e}). "
-                f"Используются известные бесплатные модели.")
+                "Не удалось получить бесплатные модели от %s (%s). "
+                "Используются известные бесплатные модели.",
+                router["name"], exc,
+            )
             return KNOWN_FREE_MODELS.get(router["name"], [])

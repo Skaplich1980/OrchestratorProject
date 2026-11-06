@@ -70,6 +70,13 @@ class QwenPlanner(BaseAgent):
                 self.model, config["router"]
             )
 
+            default_headers = {}
+            if config["router"] == "openrouter":
+                default_headers = {
+                    "HTTP-Referer": "https://github.com/Skaplich1980/OrchestratorProject",
+                    "X-Title": "Python Multi-Agent Orchestrator",
+                }
+
             client = AsyncOpenAI(
                 api_key=config["api_key"],
                 base_url=config["base_url"],

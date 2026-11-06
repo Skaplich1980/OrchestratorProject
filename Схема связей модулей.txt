@@ -1,0 +1,21 @@
+orchestrator.py
+    ¦
+    +-- agents/planner.py ------¬
+    ¦                           +-- ModelResolver.get_execution_queue()
+    +-- agents/reviewer.py ------         ¦
+    ¦                                     ¡
+    ¦                          model_resolver.py
+    ¦                                     ¦
+    ¦                          _fetch_models_from_router()
+    ¦                                     ¦
+    ¦                                     ¡
+    ¦                          openrouter_utils.py  < ÍÎÂÛÉ
+    ¦                          get_free_model_ids()
+    ¦                                     ¦
+    ¦                                     ¡
+    ¦                          httpx > OpenRouter/OrcaRouter API
+    ¦                                     ¦
+    ¦                          is_free_model()  < ôèëüòðàöèÿ ':free' / '-free'
+    ¦                          BLACKLIST_KEYWORDS
+    ¦
+    L-- config.py  (routers_config, priority_keywords)

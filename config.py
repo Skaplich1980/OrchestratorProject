@@ -41,7 +41,7 @@ class Settings(BaseSettings):
 
     # --- РОУТЕРЫ И МОДЕЛИ ---------------------------------------------
     priority_keywords_str: str = Field(
-        default="qwen3, deepseek-v3, qwen-2.5-72b",
+        default="qwen3, deepseek-v3, qwen-2.5-72b, nemotron",
         alias="PRIORITY_KEYWORDS",
     )
     models_cache_path: str = Field(
@@ -70,19 +70,19 @@ class Settings(BaseSettings):
         Каждый элемент: {name, base_url, api_key, priority}.
         """
         routers: list[dict] = []
-        if self.orcarouter_api_key:
-            routers.append({
-                "name": "orcarouter",
-                "base_url": self.orcarouter_base_url,
-                "api_key": self.orcarouter_api_key,
-                "priority": 0,
-            })
-        if self.openrouter_api_key:
+        if self.openrouter_api_key:  # ← сначала OpenRouter
             routers.append({
                 "name": "openrouter",
                 "base_url": self.openrouter_base_url,
                 "api_key": self.openrouter_api_key,
-                "priority": 1,
+                "priority": 0,  # ← высший приоритет
+            })
+        if self.orcarouter_api_key:  # ← потом OrcaRouter
+            routers.append({
+                "name": "orcarouter",
+                "base_url": self.orcarouter_base_url,
+                "api_key": self.orcarouter_api_key,
+                "priority": 1,  # ← резервный
             })
         routers.sort(key=lambda r: r["priority"])
         return routers

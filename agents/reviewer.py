@@ -112,6 +112,14 @@ class QwenReviewer(BaseAgent):
                 step_number, self.model, config["router"]
             )
 
+            # Заголовки, обязательные для OpenRouter (иначе 403 на free-моделях)
+            default_headers: dict[str, str] = {}
+            if config["router"] == "openrouter":
+                default_headers = {
+                    "HTTP-Referer": "https://github.com/your-orchestrator",
+                    "X-Title": "Python Multi-Agent Orchestrator",
+                }
+
             client = AsyncOpenAI(
                 api_key=config["api_key"],
                 base_url=config["base_url"],
